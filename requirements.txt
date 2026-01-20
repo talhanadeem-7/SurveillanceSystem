@@ -1,0 +1,41 @@
+# Computer Vision
+ultralytics>=8.0.0
+opencv-python
+numpy
+torch
+torchvision
+
+# Data & Logging
+pandas
+
+# AI & NLP (For the "Analyst" Phase)
+langchain
+langchain-google-genai
+chromadb
+python-dotenv
+
+# Utilities
+tqdm
+
+# Midas Depth reasoning
+timm
+
+# Face recognition
+deepface
+tf-keras
+
+langchain
+langchain-community
+langchain-google-genai
+chromadb
+python-dotenv
+pydantic
+langchain-openai
+
+# ST-GCN
+einops
+
+# Frontend
+streamlit
+streamlit-drawable-canvas
+Pillow
