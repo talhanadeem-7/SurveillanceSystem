@@ -1,2 +1,16 @@
 Timestamp,Entity,Action,Status,Location
 
+2026-07-15 21:37:15,Person_1,Intrusion,UNAUTHORIZED,Laptop
+2026-07-15 21:37:41,ASSET,Theft,STOLEN,Laptop
+2026-07-23 01:33:58,Person_1,Intrusion,UNAUTHORIZED,Restricted_1
+2026-07-23 01:34:24,ASSET,Theft,STOLEN,Restricted_1
+2026-07-23 02:17:07,Person_1,Identity,Recognized as Talha,General Area
+2026-07-23 02:17:41,Person_1,Identity,Recognized as Talha,General Area
+2026-07-23 02:17:46,Talha,Access,AUTHORIZED,Restricted_1
+2026-07-23 02:17:48,Person_1,Identity,Revoked Talha (mismatch),General Area
+2026-07-23 02:17:48,Person_1,Intrusion,UNAUTHORIZED,Restricted_1
+2026-07-23 02:17:57,Person_1,Identity,Recognized as Talha,General Area
+2026-07-23 02:17:57,Talha,Access,AUTHORIZED,Restricted_1
+2026-07-23 02:20:42,Person_1,Identity,Recognized as Talha,General Area
+2026-07-23 02:20:47,Talha,Access,AUTHORIZED,Restricted_1
+2026-07-23 02:21:28,Person_1,Identity,Recognized as Talha,General Area

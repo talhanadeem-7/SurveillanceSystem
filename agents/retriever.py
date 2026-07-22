@@ -38,7 +38,6 @@ class LogRetriever:
 
         print(f"Ingesting {len(docs)} events into Knowledge Base using OpenAI...")
         
-        # RESET STRATEGY: Delete old Google-based DB if it exists
         if os.path.exists(self.db_path):
             try:
                 shutil.rmtree(self.db_path)

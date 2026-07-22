@@ -1,7 +1,8 @@
 # Computer Vision
 ultralytics>=8.0.0
+boxmot>=10.0.0          # StrongSORT tracker — requires Python 3.11 or 3.12
 opencv-python
-numpy
+numpy==1.26.4           # boxmot hard-requires this exact numpy version
 torch
 torchvision
 

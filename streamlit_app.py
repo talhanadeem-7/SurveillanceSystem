@@ -1,42 +1,52 @@
 import streamlit as st
 import cv2
 import os
+import logging
 import numpy as np
 import time
 import datetime
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
-
-# 1. Import your existing project configuration
 import config
 
-# 2. Import your Vision Logic (The "Watchman")
 from vision.detector import PoseDetector
 from vision.pose_analyzer import PoseAnalyzer
 from vision.face_recognition import FaceIdentifier
-from vision.action_recognizer import ActionRecognizer
 
-# 3. Import your Storage and Utility Logic
 from storage.event_logger import EventLogger
-from utils.video_utils import draw_surveillance_ui  # We use the drawing logic
+from utils.video_utils import draw_surveillance_ui  # use the drawing logic
 from utils.csv_utils import LogAnalyzer
 
-# 4. Import your Agentic AI (The "Analyst" - Shelby)
 from agents.reasoning_agent import SecurityAnalyst
+from utils.heatmap import (
+    record_position,
+    generate_heatmap,
+    generate_trajectory,
+    generate_combined,
+    draw_heatmap_legend,
+    get_display_name,
+)
 
-# --- STEP 3: FILE UPLOADER & PRE-PROCESSING ---
+
+def configure_logging():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
 def handle_video_upload():
+    # creates a button on the sidebar: "Upload Footage".
     st.sidebar.header("1. Upload Footage")
     uploaded_file = st.sidebar.file_uploader("Choose a video file", type=["mp4", "avi", "mov"])
 
     if uploaded_file is not None:
-        # 1. Create directory if it doesn't exist
+        # Create directory if it doesn't exist
         if not os.path.exists(config.VIDEO_DIR):
             os.makedirs(config.VIDEO_DIR)
 
-        # 2. Save the file to the path config.py expects
+        # Save the file to the path config.py expects
         video_path = os.path.join(config.VIDEO_DIR, uploaded_file.name)
         
         # Only write if it hasn't been saved yet
@@ -46,7 +56,7 @@ def handle_video_upload():
             
             st.session_state.video_path = video_path
             
-            # 3. Extract the first frame for Zone Setup
+            # Extract the first frame for Zone Setup
             cap = cv2.VideoCapture(video_path)
             ret, frame = cap.read()
             if ret:
@@ -60,9 +70,8 @@ def handle_video_upload():
     
     return st.session_state.video_path
 
-# --- STEP 4: WEB-BASED ZONE DRAWING ---
 
-# --- UPDATED STEP 4: WEB-BASED ZONE DRAWING WITH MANUAL NAMING ---
+# --- WEB-BASED ZONE DRAWING WITH MANUAL NAMING ---
 
 def define_zones_ui():
     st.header("2. Define Surveillance Zones")
@@ -167,57 +176,121 @@ def define_zones_ui():
 
                     st.session_state.zones = processed_zones
                     st.success(f"✅ Saved {len(processed_zones)} zones with custom names!")
-# --- ADD THIS FUNCTION BELOW define_zones_ui() ---
 
 def run_surveillance():
+    #  It processes the video frame by frame.
     st.header("3. Live Surveillance")
 
     if not st.session_state.zones:
         st.warning("Please define zones in 'Zone Setup' first.")
         return
 
-    # UI Layout: Create a spot for the video and a spot for live logs
+    # It creates the layout for the video player and the "Stop" button. It also calls setup_surveillance_memory() to create the empty dictionaries needed to track people (like remembering who is "Person 1" and where they were 5 seconds ago).
     col1, col2 = st.columns([3, 1])
     with col1:
-        frame_placeholder = st.empty()  # This is your "Web Screen"
+        frame_placeholder = st.empty()  #  "Web Screen"
         stop_btn = st.button("Stop Surveillance")
     with col2:
         st.subheader("Live Status")
         status_text = st.empty()
 
-    # --- INJECTING YOUR MEMORY SETUP ---
+    # --- INJECTING MEMORY SETUP ---
     (
         analyzer,
         identity_map,
         unknown_check_counters,
+        face_candidate_state,
         intrusion_persistence,
         person_location_state,
         behavior_logged_ids,
         logged_general_ids,
         track_ids_logged_general,
-        person_action_state,
-        person_action_persistence,
-        ACTION_STABILITY_THRESHOLD,
         PERSISTENCE_THRESHOLD,
     ) = setup_surveillance_memory()
+    identity_revalidation_state = {}
+
+    # Reset IdentityGuardian so stale embeddings from a previous run
+    # don't cause wrong matches in the new session.
+    from vision.identity_guardian import IdentityGuardian
+    snapshot_root = st.session_state.detector.guardian.snapshot_root
+    st.session_state.detector.guardian = IdentityGuardian(
+        snapshot_root=str(snapshot_root)
+    )
 
     # Setup Video capture
     cap = cv2.VideoCapture(st.session_state.video_path)
-    zones = st.session_state.zones  # Get zones from the canvas setup
 
-    # --- THE LOGIC YOU PROVIDED GOES HERE ---
+    # --- PERFORMANCE: read native FPS and set buffer size ---
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # small buffer prevents stale frames
+
+    # --- PERFORMANCE: process every Nth frame (skip frames) ---
+    # At 30 fps native, FRAME_SKIP=2 means we run inference at ~15 fps,
+    # which is plenty for surveillance while halving GPU load.
+    FRAME_SKIP = 2   # increase to 3 for weaker hardware
+
+    # --- PERFORMANCE: downscale inference resolution ---
+    # We detect at a smaller size and draw on the original frame.
+    # 640 wide is the YOLO native resolution anyway; going larger wastes GPU.
+    INFERENCE_WIDTH = 640
+
+    zones = st.session_state.zones
+    frame_id = 0
+    last_depth_map = None
+    DEPTH_REFRESH_INTERVAL = 5
+
+    # Timing: keep display smooth at a capped rate
+    target_display_interval = 1.0 / min(native_fps / FRAME_SKIP, 30.0)
+    last_display_time = 0.0
+
     while cap.isOpened() and not stop_btn:
         ret, frame = cap.read()
         if not ret:
             break
+        frame_id += 1
+
+        # --- FRAME SKIP: forward-read to maintain real-time pace ---
+        if frame_id % FRAME_SKIP != 0:
+            continue
+
+        # --- DOWNSCALE for inference, keep original for drawing ---
+        orig_h, orig_w = frame.shape[:2]
+        scale = INFERENCE_WIDTH / orig_w
+        if scale < 1.0:                         # only shrink, never upscale
+            infer_frame = cv2.resize(
+                frame, (INFERENCE_WIDTH, int(orig_h * scale)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            infer_frame = frame                 # already small enough
 
         # A. Align Zones (Homography)
         zones = analyzer.align_zones(frame, zones)
 
-        # B. Detect People
-        results = st.session_state.detector.track_and_detect(frame)
+        # B. Run YOLO on the (possibly downscaled) inference frame.
+        results = st.session_state.detector.track_and_detect(infer_frame)
+
+        # Scale detections back to original resolution so downstream zone
+        # logic, face crops, and skeleton drawing stay in one coordinate space.
+        # We clone() first because YOLO returns inference-mode tensors which
+        # do not allow in-place operations (PyTorch InferenceMode restriction).
+        if results.boxes is not None and scale < 1.0:
+            # xyxy is a read-only property — scale the underlying .data tensor.
+            # Boxes.data format: [x1, y1, x2, y2, (track_id,) conf, cls]
+            boxes_data = results.boxes.data.clone()
+            boxes_data[:, [0, 2]] /= scale   # x-coords
+            boxes_data[:, [1, 3]] /= scale   # y-coords
+            results.boxes.data = boxes_data
+
+            if results.keypoints is not None and results.keypoints.data is not None:
+                kpts_data = results.keypoints.data.clone()
+                kpts_data[:, :, 0] /= scale  # x-coords
+                kpts_data[:, :, 1] /= scale  # y-coords
+                results.keypoints.data = kpts_data
 
         # --- CONDITIONAL DEPTH ---
+        #  It checks if any person is visually overlapping a zone box in 2D.
+        # This block ensures we only turn on the "Depth Brain" (MiDaS) if someone is actually close to a zone. If everyone is far away, we skip this to save speed.
         depth_map = None
         needs_depth = False
         if results.boxes is not None:
@@ -228,7 +301,13 @@ def run_surveillance():
                     break
 
         if needs_depth:
-            depth_map = analyzer.get_depth_map(frame)
+            should_refresh_depth = (
+                last_depth_map is None
+                or frame_id % DEPTH_REFRESH_INTERVAL == 0
+            )
+            if should_refresh_depth:
+                last_depth_map = analyzer.get_depth_map(frame)
+            depth_map = last_depth_map
 
         # Reset labels
         for z in zones:
@@ -241,25 +320,32 @@ def run_surveillance():
         if results.boxes is not None and results.boxes.id is not None:
             ids = results.boxes.id.cpu().numpy().astype(int)
 
+
             for i in range(len(results.boxes)):
                 current_id = ids[i]
                 bbox = results.boxes.xyxy[i].cpu().numpy()
                 kpts = results[i].keypoints
 
+                # --- HEATMAP: record foot position for this track ---
+                record_position(
+                    st.session_state.track_positions,
+                    current_id,
+                    bbox,
+                    frame_id,
+                )
+
                 # --- A. DETERMINE CURRENT LOCATION (Passive Context) ---
-                current_loc = "General Area"
+                #  It checks where the person is standing.
+                current_loc = "General Area" 
                 passive_zones = [z for z in zones if z["type"] == "passive"]
 
                 if analyzer.check_trespassing(
                     kpts, bbox, passive_zones, depth_map, person_id=current_id
                 ):
                     for z in passive_zones:
-                        fx = (kpts.xyn[0][15][0] + kpts.xyn[0][16][0]) / 2
-                        fy = (kpts.xyn[0][15][1] + kpts.xyn[0][16][1]) / 2
-                        foot_x, foot_y = (
-                            int(fx * frame.shape[1]),
-                            int(fy * frame.shape[0]),
-                        )
+                        fx = (kpts.xy[0][15][0] + kpts.xy[0][16][0]) / 2
+                        fy = (kpts.xy[0][15][1] + kpts.xy[0][16][1]) / 2
+                        foot_x, foot_y = (int(fx), int(fy))
                         if cv2.pointPolygonTest(
                             z["polygon"], (foot_x, foot_y), False
                         ) >= 0:
@@ -267,16 +353,74 @@ def run_surveillance():
                             break
 
                 # --- B. 1. FACE RECOGNITION ---
+                #  Every 30 frames, it checks the person's face against the database. If recognized, it updates their name from "Person_1" to "Talha."
                 display_name = f"Person_{current_id}"
                 is_authorized = False
 
-                if current_id in identity_map:
-                    display_name = identity_map[current_id]
-                    is_authorized = True
-                else:
-                    if current_id not in unknown_check_counters:
-                        unknown_check_counters[current_id] = 0
+                if current_id not in unknown_check_counters:
+                    unknown_check_counters[current_id] = 0
+                if current_id not in face_candidate_state:
+                    face_candidate_state[current_id] = {"name": None, "count": 0}
+                if current_id not in identity_revalidation_state:
+                    identity_revalidation_state[current_id] = {"fails": 0}
 
+                if current_id in identity_map:
+                    mapped_name = identity_map[current_id]
+                    display_name = mapped_name
+                    is_authorized = True
+
+                    if (
+                        unknown_check_counters[current_id]
+                        % config.FACE_REVALIDATE_INTERVAL
+                        == 0
+                    ):
+                        face_crop = (
+                            st.session_state.face_recognizer.extract_face_crop(
+                                frame, kpts
+                            )
+                        )
+                        recheck_name = None
+                        if face_crop is not None:
+                            recheck_name = (
+                                st.session_state.face_recognizer.identify_person(
+                                    face_crop
+                                )
+                            )
+
+                        if recheck_name == mapped_name:
+                            # Confirmed: still the same person.
+                            identity_revalidation_state[current_id]["fails"] = 0
+                        elif recheck_name is None:
+                            # No face visible this check (turned away, out of
+                            # frame, poor angle) or no confident match - this is
+                            # inconclusive, NOT a contradiction. A locked identity
+                            # should not erode just because the face was briefly
+                            # unobservable, so leave the fail counter untouched.
+                            pass
+                        else:
+                            # A DIFFERENT enrolled identity was confidently
+                            # matched on this track - a genuine mismatch signal
+                            # (e.g. an ID/track swap), so this still counts.
+                            identity_revalidation_state[current_id]["fails"] += 1
+                            if (
+                                identity_revalidation_state[current_id]["fails"]
+                                >= config.FACE_REVALIDATION_FAILS
+                            ):
+                                identity_map.pop(current_id, None)
+                                face_candidate_state[current_id] = {
+                                    "name": None,
+                                    "count": 0,
+                                }
+                                identity_revalidation_state[current_id]["fails"] = 0
+                                display_name = f"Person_{current_id}"
+                                is_authorized = False
+                                st.session_state.logger._write_to_csv_and_terminal(
+                                    f"Person_{current_id}",
+                                    "Identity",
+                                    f"Revoked {mapped_name} (mismatch)",
+                                    current_loc,
+                                )
+                else:
                     if (
                         unknown_check_counters[current_id]
                         % config.FACE_CHECK_INTERVAL
@@ -293,104 +437,36 @@ def run_surveillance():
                                     face_crop
                                 )
                             )
+                            candidate = face_candidate_state[current_id]
+
                             if found_name:
-                                identity_map[current_id] = found_name
-                                display_name = found_name
-                                is_authorized = True
+                                if candidate["name"] == found_name:
+                                    candidate["count"] += 1
+                                else:
+                                    candidate["name"] = found_name
+                                    candidate["count"] = 1
 
-                                st.session_state.logger._write_to_csv_and_terminal(
-                                    f"Person_{current_id}",
-                                    "Identity",
-                                    f"Recognized as {found_name}",
-                                    current_loc,
-                                )
+                                if candidate["count"] >= config.FACE_CONFIRMATION_REQUIRED:
+                                    identity_map[current_id] = found_name
+                                    display_name = found_name
+                                    is_authorized = True
 
-                                behavior_logged_ids.add(found_name)
-                                logged_general_ids.add(found_name)
+                                    st.session_state.logger._write_to_csv_and_terminal(
+                                        f"Person_{current_id}",
+                                        "Identity",
+                                        f"Recognized as {found_name}",
+                                        current_loc,
+                                    )
 
-                    unknown_check_counters[current_id] += 1
+                                    behavior_logged_ids.add(found_name)
+                                    logged_general_ids.add(found_name)
+                            else:
+                                candidate["name"] = None
+                                candidate["count"] = 0
 
-                # --- C. HANDLE LOCATION STATE CHANGE ---
-                detected_action = (
-                    st.session_state.action_recognizer.update(current_id, kpts)
-                    or "Standing"
-                )
-
-                if current_id not in person_location_state:
-                    person_location_state[current_id] = None
-                if current_id not in person_action_state:
-                    person_action_state[current_id] = "Standing"
-                if current_id not in person_action_persistence:
-                    person_action_persistence[current_id] = 0
-
-                last_loc = person_location_state[current_id]
-                last_act = person_action_state[current_id]
-                should_log = False
-
-                if current_loc != last_loc:
-                    should_log = True
-                    person_action_persistence[current_id] = 0
-                elif detected_action == "Picking Up":
-                    should_log = True
-                    person_action_persistence[current_id] = 0
-                elif detected_action in ["Punch", "Kick", "Fall"]:
-                    should_log = True
-                    person_action_persistence[current_id] = 0
-                elif detected_action != last_act:
-                    person_action_persistence[current_id] += 1
-                    if (
-                        person_action_persistence[current_id]
-                        >= ACTION_STABILITY_THRESHOLD
-                    ):
-                        should_log = True
-                        person_action_persistence[current_id] = 0
-                else:
-                    person_action_persistence[current_id] = 0
-
-                if should_log and current_loc == "General Area":
-                    generic_label = f"Person_{current_id}"
-                    if (
-                        display_name in logged_general_ids
-                        or generic_label in logged_general_ids
-                    ):
-                        if detected_action in ["Walking", "Standing"]:
-                            should_log = False
-
-                # --- D. ACTION RECOGNITION LOGGING ---
-                if detected_action:
-                    is_priority = detected_action in [
-                        "Punch",
-                        "Kick",
-                        "Fall",
-                        "Picking Up",
-                    ]
-
-                    should_log_act = False
-                    if is_priority:
-                        should_log_act = True
-                    elif should_log:
-                        should_log_act = True
-
-                    if should_log_act:
-                        if (
-                            current_id not in behavior_logged_ids
-                            and display_name not in behavior_logged_ids
-                        ):
-                            st.session_state.logger.log_event(
-                                display_name,
-                                "Behavior",
-                                detected_action,
-                                True,
-                                location=current_loc,
-                            )
-
-                            behavior_logged_ids.add(current_id)
-                            behavior_logged_ids.add(display_name)
-                            if current_loc == "General Area":
-                                track_ids_logged_general.add(current_id)
+                unknown_check_counters[current_id] += 1
 
                 person_location_state[current_id] = current_loc
-                person_action_state[current_id] = detected_action
 
                 # --- E. GLOBAL PERSISTENCE ---
                 raw_is_tres = analyzer.check_trespassing(
@@ -421,6 +497,7 @@ def run_surveillance():
                     anybody_overlapping_2d = True
 
                 # --- F. ZONE-SPECIFIC LOGIC ---
+                # If an unauthorized person touches a Restricted Zone for a few frames, it triggers an "Intrusion" alert.
                 for z in zones:
                     if z["type"] == "restricted":
                         this_zone_tres = analyzer.check_trespassing(
@@ -455,6 +532,8 @@ def run_surveillance():
             results.is_trespassing = person_statuses
 
         # --- G. Theft Detection ---
+        # It checks if an object has disappeared.
+        # runs only when people move away (no overlap). It compares the "Edge Density" of the zone now vs. the beginning. If the edges are gone (laptop missing), it triggers a Theft alert. It checks who the last person was to decide if it was "Stolen" (Stranger) or "Removed" (Authorized Person).
         if not anybody_overlapping_2d:
             for z in zones:
                 if z["type"] == "restricted":
@@ -508,11 +587,26 @@ def run_surveillance():
         # --- H. RENDERING AND UI UPDATES ---
         draw_surveillance_ui(frame, results, zones, identity_map)
 
-        frame_placeholder.image(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-            channels="RGB",
-            use_container_width=True,
-        )
+        # --- PERFORMANCE: throttle display — only push frame to browser
+        # at the target rate.  Heavy inference can run every loop tick,
+        # but st.image() is expensive; skipping a render never drops a frame
+        # from the analysis, just from the preview.
+        now = time.time()
+        if now - last_display_time >= target_display_interval:
+            frame_placeholder.image(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                channels="RGB",
+                use_column_width=True,
+            )
+            # Show IdentityGuardian live stats in the status panel
+            guardian_stats = st.session_state.detector.guardian.get_stats()
+            status_text.markdown(
+                f"**Frame:** {frame_id}\n\n"
+                f"**Known Identities:** {guardian_stats['known_identities']}\n\n"
+                f"**ID Corrections:** {guardian_stats['active_remaps']}\n\n"
+                f"**Retired IDs:** {guardian_stats['retired_ids']}"
+            )
+            last_display_time = now
 
         st.session_state.logger.update_logs()
 
@@ -527,6 +621,7 @@ def run_surveillance():
 
 
 def run_shelby_analyst():
+    # The Chatbot Interface.
     st.subheader("🕵️ Chat with Shelby")
     
     # 1. Initialize your existing SecurityAnalyst class
@@ -555,7 +650,120 @@ def run_shelby_analyst():
                 else:
                     st.error(f"Error: {e}")
 
-# Update your main() to include this
+def run_heatmap_tab():
+    """
+    Heatmap & Trajectory tab — visualizes movement data collected during
+    the surveillance run.  No surveillance logic is touched here.
+    """
+    st.header("🔥 Person Movement Heatmap & Trajectory")
+
+    track_positions = st.session_state.get("track_positions", {})
+    identity_map    = st.session_state.get("identity_map", {})
+    first_frame_rgb = st.session_state.get("first_frame", None)
+
+    if not track_positions:
+        st.info("No movement data yet. Run the Surveillance Engine first.")
+        return
+
+    if first_frame_rgb is None:
+        st.warning("Reference frame not available. Please upload a video first.")
+        return
+
+    # Reference frame in BGR for OpenCV drawing functions
+    ref_bgr = cv2.cvtColor(first_frame_rgb, cv2.COLOR_RGB2BGR)
+
+    # --- Person selector ---
+    st.subheader("Select Person")
+    track_ids = sorted(track_positions.keys())
+    id_labels  = {tid: get_display_name(tid, identity_map) for tid in track_ids}
+
+    # "All" option + individual persons
+    all_label   = "👥 All Persons (combined)"
+    select_opts = [all_label] + [f"{id_labels[tid]} (ID {tid})" for tid in track_ids]
+    selected    = st.selectbox("Choose who to visualize:", select_opts)
+
+    # --- View mode ---
+    st.subheader("Visualization Mode")
+    view_mode = st.radio(
+        "Select view:",
+        ["🌡️ Heatmap only", "🛤️ Trajectory only", "🔀 Combined (Heatmap + Trajectory)"],
+        horizontal=True,
+    )
+
+    # --- Advanced settings (collapsed by default) ---
+    with st.expander("⚙️ Advanced Settings"):
+        sigma = st.slider(
+            "Heatmap blur radius (sigma)",
+            min_value=5, max_value=80, value=35, step=5,
+            help="Higher = smoother/broader heat blobs. Lower = sharper/tighter.",
+        )
+        alpha = st.slider(
+            "Heatmap opacity",
+            min_value=0.1, max_value=0.9, value=0.55, step=0.05,
+            help="How strongly the heatmap overlays the background frame.",
+        )
+        show_legend = st.checkbox("Show colour bar legend", value=True)
+
+    # --- Generate button ---
+    if st.button("🎨 Generate Visualization", type="primary"):
+
+        # Gather positions for the selected person(s)
+        if selected == all_label:
+            # Merge all tracks into one flat list
+            all_positions = []
+            for tid in track_ids:
+                all_positions.extend(track_positions[tid])
+            positions_to_use = all_positions
+            vis_label = "All Persons"
+        else:
+            # Parse track ID from the label string
+            chosen_tid = int(selected.split("ID ")[-1].rstrip(")"))
+            positions_to_use = track_positions[chosen_tid]
+            vis_label = id_labels[chosen_tid]
+
+        if not positions_to_use:
+            st.warning("No position data available for the selected person.")
+            return
+
+        with st.spinner("Generating visualization..."):
+
+            if "Heatmap" in view_mode:
+                result_bgr = generate_heatmap(
+                    positions_to_use, ref_bgr,
+                    sigma=sigma, alpha=alpha,
+                )
+            elif "Trajectory" in view_mode:
+                result_bgr = generate_trajectory(positions_to_use, ref_bgr)
+            else:  # Combined
+                result_bgr = generate_combined(
+                    positions_to_use, ref_bgr,
+                    sigma=sigma, alpha=alpha,
+                )
+
+            if show_legend and "Trajectory" not in view_mode:
+                result_bgr = draw_heatmap_legend(result_bgr)
+
+        # Display
+        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        st.image(result_rgb, caption=f"{vis_label} — {view_mode}", use_column_width=True)
+
+        # Stats
+        n_frames = len(set(p[2] for p in positions_to_use))
+        n_points  = len(positions_to_use)
+        c1, c2 = st.columns(2)
+        c1.metric("Total positions recorded", n_points)
+        c2.metric("Frames active", n_frames)
+
+        # Download button
+        _, img_encoded = cv2.imencode(".png", result_bgr)
+        st.download_button(
+            label="⬇️ Download as PNG",
+            data=img_encoded.tobytes(),
+            file_name=f"shelby_heatmap_{vis_label.replace(' ', '_')}.png",
+            mime="image/png",
+        )
+
+
 def main():
     st.title("🛡️ Shelby: Intelligent Surveillance Dashboard")
     
@@ -564,7 +772,7 @@ def main():
 
     if v_path:
         # In Streamlit, we use tabs to navigate the app's workflow
-        tab1, tab2, tab3 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst", "🔥 Heatmap & Trajectory"])
         
         with tab1:
             define_zones_ui()
@@ -593,13 +801,17 @@ def main():
                 # Run the chat interface
                 run_shelby_analyst()
 
+        with tab4:
+            run_heatmap_tab()
 
-# --- SESSION STATE INITIALIZATION ---
+
 
 
 def initialize_surveillance_components():
+    # It loads the heavy AI models (YOLO and Face Recognition) once when the app starts, so it doesn't have to reload them every time you click a button. This makes the app faster.
     # 1. Setup basic components (Mapped to Session State for performance)
     if 'detector' not in st.session_state:
+        # PoseDetector already includes the StrongSORT-backed tracker used in live surveillance.
         st.session_state.detector = PoseDetector()
     
     if 'logger' not in st.session_state:
@@ -611,10 +823,6 @@ def initialize_surveillance_components():
     if 'face_recognizer' not in st.session_state:
         with st.spinner("Initializing Face Recognition System..."):
             st.session_state.face_recognizer = FaceIdentifier()
-
-    if 'action_recognizer' not in st.session_state:
-        with st.spinner("Initializing Action Brain..."):
-            st.session_state.action_recognizer = ActionRecognizer(model_path=config.ACTION_MODEL_PATH)
 
 def setup_surveillance_memory():
 
@@ -630,29 +838,26 @@ def setup_surveillance_memory():
     # --- MEMORY STORES (Exactly as per your app.py) ---
     identity_map = {}
     unknown_check_counters = {}
+    face_candidate_state = {}
     intrusion_persistence = {}
     person_location_state = {}  # Tracks where each person was last seen
     behavior_logged_ids = set()  
     logged_general_ids = set()  
     track_ids_logged_general = set() # Tracks physical body IDs
-    person_action_state = {}
-    person_action_persistence = {}
-    
-    # Logic Settings
-    ACTION_STABILITY_THRESHOLD = 10 # frames (~0.5 seconds)
     PERSISTENCE_THRESHOLD = 5
     
-    return (analyzer, identity_map, unknown_check_counters, intrusion_persistence, 
+    return (analyzer, identity_map, unknown_check_counters, face_candidate_state, intrusion_persistence, 
             person_location_state, behavior_logged_ids, logged_general_ids, 
-            track_ids_logged_general, person_action_state, person_action_persistence, 
-            ACTION_STABILITY_THRESHOLD, PERSISTENCE_THRESHOLD)
+            track_ids_logged_general, PERSISTENCE_THRESHOLD)
 
 
 
 
 # Run the initialization
 if __name__ == "__main__":
+    # The Navigator.
     st.set_page_config(page_title="Intelligent Surveillance - Shelby", layout="wide")
+    configure_logging()
     
     if 'initialized' not in st.session_state:
         initialize_surveillance_components()
@@ -661,6 +866,7 @@ if __name__ == "__main__":
         st.session_state.zones = []
         st.session_state.identity_map = {}
         st.session_state.processing_complete = False
+        st.session_state.track_positions = {}   # {track_id: [(cx, cy, frame_id), ...]}
         # REMOVED: st.session_state.chat_history = [] 
     
     main()

@@ -5,10 +5,12 @@ import os
 import config
 
 class LogAnalyzer:
-    def __init__(self):
+    def __init__(self): 
+        # remembers where the CSV file (the logbook) is located on your computer.
         self.csv_path = config.LOG_PATH
 
     def load_data(self):
+        #  It opens the CSV file and loads it into a table (DataFrame) that the code can understand.
         """
         Safely loads the CSV file into a pandas DataFrame.
         """
@@ -24,10 +26,8 @@ class LogAnalyzer:
             if df.empty:
                 return pd.DataFrame(columns=required_columns)
             
-            # Clean headers
             df.columns = [c.strip() for c in df.columns]
             
-            # Double check that Location exists in the file
             if 'Location' not in df.columns:
                  df['Location'] = "General Area"
                  
@@ -37,6 +37,7 @@ class LogAnalyzer:
             return pd.DataFrame(columns=required_columns)
 
     def get_recent_logs_as_text(self, limit=20):
+        # takes the last 20 things that happened and turns them into simple English sentences.
         """
         Converts the last N rows into natural language sentences for the LLM.
         Example Output:
@@ -73,6 +74,7 @@ class LogAnalyzer:
         return "\n".join(narrative)
 
     def get_statistics(self):
+        # counts everything up to give you a quick report.
         """
         Returns high-level stats for the Agent.
         """
@@ -98,6 +100,7 @@ class LogAnalyzer:
         return stats
 
     def get_all_logs_formatted(self):
+        # It reads everything that ever happened and turns it into a detailed story.
         """
         Reads ALL logs and returns a list of natural language sentences.
         Uses state-tracking to describe transitions (e.g., Sitting -> Walking = 'got up').

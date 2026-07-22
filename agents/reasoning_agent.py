@@ -6,6 +6,7 @@ from agents.retriever import LogRetriever
 
 class SecurityAnalyst:
     def __init__(self):
+        #  It starts the LogRetriever. This is the tool that searches through your CSV file to find relevant information (analyzed in retriever.py, if you have that).
         print("Initializing Security Analyst AI (OpenAI Version)...")
         
         # 1. Initialize the Retriever (The Knowledge Base)
@@ -77,7 +78,7 @@ class SecurityAnalyst:
         self.chain = self.prompt | self.llm
 
     def consult(self, query):
-        # 1. Retrieve Relevant Logs
+        # This is the function called when you type a question in the chat box.
         docs = self.retriever.query_relevant_logs(query, k=15)
         context_text = "\n".join([d.page_content for d in docs]) if docs else "No specific logs found for this query."
         

@@ -159,13 +159,14 @@ def draw_surveillance_ui(frame, results, zones, identity_map=None):
                 label = identity_map[p_id]
                 box_color = config.COLOR_AUTHORIZED 
             
-            # A. Draw Bounding Box (Logic unchanged)
+            # A. Draw Bounding Box
             x1, y1, x2, y2 = map(int, box_data.xyxy[0])
             cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+            
+            # Draw Name/ID Label
             cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-            # --- NEW: DRAW SKELETON ---
-            # Get keypoints for this specific person
+            # --- DRAW SKELETON ---
             kpts = results.keypoints[i]
             pts = kpts.xy[0].cpu().numpy()
             conf = kpts.conf[0].cpu().numpy()
@@ -173,13 +174,13 @@ def draw_surveillance_ui(frame, results, zones, identity_map=None):
             # B. Draw Lines (Skeletal Links)
             for edge in config.SKELETON_EDGES:
                 p1_idx, p2_idx = edge
-                if conf[p1_idx] > 0.5 and conf[p2_idx] > 0.5: # Only draw if high confidence
+                if conf[p1_idx] > 0.5 and conf[p2_idx] > 0.5:
                     p1 = (int(pts[p1_idx][0]), int(pts[p1_idx][1]))
                     p2 = (int(pts[p2_idx][0]), int(pts[p2_idx][1]))
                     cv2.line(frame, p1, p2, box_color, 2)
 
-            # C. Draw Joints (White dots like your image)
+            # C. Draw Joints (White dots)
             for j in range(len(pts)):
                 if conf[j] > 0.5:
                     kx, ky = int(pts[j][0]), int(pts[j][1])
-                    cv2.circle(frame, (kx, ky), 4, (255, 255, 255), -1) # White dot
+                    cv2.circle(frame, (kx, ky), 4, (255, 255, 255), -1)

@@ -14,6 +14,7 @@ class EventLogger:
         self._initialize_log_file()
 
     def _initialize_log_file(self):
+        # The File Creator.
         """
         Creates the CSV file with headers if it is missing OR empty.
         """
@@ -22,10 +23,10 @@ class EventLogger:
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
             with open(self.log_file, 'w', newline='') as f:
                 writer = csv.writer(f)
-                # --- NEW HEADER: Location ---
                 writer.writerow(["Timestamp", "Entity", "Action", "Status", "Location"])
 
     def log_event(self, entity_id, event_type, status, is_active, location="General Area"):
+        # The Gatekeeper.. LOgs event
         """
         Handles event logging with Debouncing.
         Added 'location' parameter.

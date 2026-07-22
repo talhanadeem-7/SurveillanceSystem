@@ -1,15 +1,20 @@
 .venv/
+venv311/
 __pycache__/
 .env
-
 # ML models
 *.pt
-
 # Data & generated files
 data/uploaded_videos/
 data/embeddings/
 data/authorized_faces/
-
+data/reid_snapshots/
+data/weights/
 # Databases
 *.sqlite3
 *.pkl
+.vscode/FYP_Proposal_extracted.txt
+
+.vscode/
+
+FYP_Proposal_extracted.txt

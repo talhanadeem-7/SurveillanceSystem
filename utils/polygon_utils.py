@@ -9,6 +9,7 @@ class PolygonDrawer:
         self.current_mouse = (0, 0)
 
     def mouse_callback(self, event, x, y, flags, param):
+        # listens for what your mouse is doing.
         if event == cv2.EVENT_MOUSEMOVE:
             self.current_mouse = (x, y)
         
@@ -23,6 +24,7 @@ class PolygonDrawer:
                 self.done = True
 
     def run(self, frame, window_name):
+        # The Drawing Loop. It pauses the video and lets you draw until you are finished.
         cv2.setMouseCallback(window_name, self.mouse_callback)
         
         while not self.done:
