@@ -34,6 +34,19 @@ class PoseDetector:
         )
         self.guardian = IdentityGuardian(snapshot_root=snapshot_root)
 
+        # Monotonic counter for detections the tracker could not match.
+        # Ephemeral ids are negative and are NEVER reused for the lifetime of
+        # this detector, so two different people can no longer end up sharing
+        # an id. The previous scheme, -(idx + 1), was positional: the person at
+        # detection index 0 was always -1, so unrelated people collided across
+        # frames in every per-id dict downstream.
+        self._next_ephemeral_id = -1
+
+    @staticmethod
+    def _guardian_enabled() -> bool:
+        """Master switch for the IdentityGuardian ReID layer (default off)."""
+        return bool(getattr(config, "IDENTITY_GUARDIAN_ENABLED", False))
+
     def track_and_detect(self, frame):
         """
         Args:
@@ -51,8 +64,17 @@ class PoseDetector:
         result = results[0]
 
         if result.boxes is None or len(result.boxes) == 0:
-            self.guardian.update(frame, np.empty((0, 4), dtype=np.float32),
-                                 np.empty((0,), dtype=np.int32))
+            # Still drive the tracker with an empty detection set. This branch
+            # is the ACTUAL empty-scene path (YOLO found nobody), and skipping
+            # the tracker here froze its frame_count, so lost tracks never aged
+            # and were re-matched to whoever appeared next. The matching guard
+            # in StrongSortTracker.update is not enough on its own, because
+            # this early return means it is never reached.
+            self.tracker.update(np.empty((0, 4), dtype=np.float32),
+                                np.empty((0,), dtype=np.float32), frame)
+            if self._guardian_enabled():
+                self.guardian.update(frame, np.empty((0, 4), dtype=np.float32),
+                                     np.empty((0,), dtype=np.int32))
             return result
 
         xyxy_np = result.boxes.xyxy.detach().cpu().numpy()
@@ -63,14 +85,24 @@ class PoseDetector:
             xyxy_np, conf_np, frame, keypoints=result.keypoints
         )
 
-        # Step 2 — IdentityGuardian corrects switches using appearance
-        corrected_ids = self.guardian.update(frame, xyxy_np, raw_ids)
+        # Step 2 — IdentityGuardian corrects switches using appearance.
+        # Gated by config.IDENTITY_GUARDIAN_ENABLED: when disabled, raw BotSort
+        # ids pass straight through so BotSort's own OSNet ReID can be measured
+        # on its own. Read per call so an A/B harness can toggle it between runs.
+        if self._guardian_enabled():
+            corrected_ids = self.guardian.update(frame, xyxy_np, raw_ids)
+        else:
+            corrected_ids = raw_ids.copy()
 
-        # Step 3 — patch negative ids with temporary display ids
+        # Step 3 — give every unmatched detection a unique, never-reused
+        # negative id. Callers must treat negative ids as EPHEMERAL: draw them
+        # and evaluate them for the current frame, but never accumulate
+        # cross-frame state against them (see run_surveillance).
         display_ids = corrected_ids.copy()
         for idx, tid in enumerate(display_ids):
             if tid < 0:
-                display_ids[idx] = -(idx + 1)
+                display_ids[idx] = self._next_ephemeral_id
+                self._next_ephemeral_id -= 1
 
         # Step 4 — rebuild Ultralytics Boxes with corrected ids
         valid_indices  = list(range(len(corrected_ids)))

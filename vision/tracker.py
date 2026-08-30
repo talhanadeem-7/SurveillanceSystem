@@ -44,12 +44,35 @@ class StrongSortTracker:
 
     def __init__(
         self,
-        max_age: int = 1200,
+        max_age: int | None = None,
         n_init: int = 1,
         max_iou_distance: float = 0.9,
         max_cosine_distance: float = 0.55,
         nn_budget: int = 150,
+        new_track_thresh: float | None = None,
+        track_buffer: int | None = None,
+        match_iou_threshold: float | None = None,
     ):
+        # max_age is read from config.TRACKER_MAX_AGE unless the caller passes
+        # one explicitly. Falls back to 75 if the config key is absent.
+        if max_age is None:
+            max_age = int(getattr(config, "TRACKER_MAX_AGE", 75))
+
+        # Minimum detection confidence for BotSort to CREATE a new track.
+        # 0.6 is boxmot's default; detections between config.CONFIDENCE_THRESHOLD
+        # and this value can never spawn a track and stay permanently unmatched.
+        if new_track_thresh is None:
+            new_track_thresh = float(
+                getattr(config, "TRACKER_NEW_TRACK_THRESH", 0.6)
+            )
+
+        # THIS, not max_age, is what governs how long a lost track survives:
+        # BotSort removes when `frame_count - end_frame > max_time_lost`, and
+        # max_time_lost derives from track_buffer. Measured boundary 31 keeps /
+        # 32 drops, invariant across max_age 5/75/1200 (CLAUDE.md VF-1).
+        if track_buffer is None:
+            track_buffer = int(getattr(config, "TRACKER_TRACK_BUFFER", 30))
+
         try:
             from boxmot.trackers.botsort.botsort import BotSort
         except ImportError as exc:
@@ -84,10 +107,13 @@ class StrongSortTracker:
                 min_hits=n_init,
                 iou_threshold=max_iou_distance,
                 max_obs=max_age + 5,  # must be > max_age per boxmot docs
+                new_track_thresh=new_track_thresh,
+                track_buffer=track_buffer,
             )
             logger.info(
-                "BotSort initialised — device=%s fp16=%s weights=%s",
-                device, fp16, model_weights,
+                "BotSort initialised — device=%s fp16=%s weights=%s "
+                "new_track_thresh=%s track_buffer=%s",
+                device, fp16, model_weights, new_track_thresh, track_buffer,
             )
         except TypeError as exc:
             # Fallback: minimal constructor if param names changed again
@@ -98,9 +124,15 @@ class StrongSortTracker:
                 half=fp16,
             )
 
-        self.match_iou_threshold = float(
-            getattr(config, "TRACKER_MATCH_IOU_THRESHOLD", 0.2)
-        )
+        # Minimum IoU to bind one of BotSort's emitted track boxes back to a
+        # YOLO detection. Exposed for visibility only: measurement showed it
+        # causes zero unmatched detections -- every unmatched detection was
+        # starved of a track box, none failed on IoU (CLAUDE.md VF-8).
+        if match_iou_threshold is None:
+            match_iou_threshold = float(
+                getattr(config, "TRACKER_MATCH_IOU_THRESHOLD", 0.2)
+            )
+        self.match_iou_threshold = float(match_iou_threshold)
 
     # ------------------------------------------------------------------
     # Public API used by detector.py
@@ -127,7 +159,18 @@ class StrongSortTracker:
         del keypoints  # not used by BotSort
 
         if xyxy is None or len(xyxy) == 0:
-            return np.array([], dtype=np.int32)
+            # Drive BotSort with an EMPTY detection array rather than returning
+            # early. BotSort.update() is what increments frame_count, and track
+            # removal is `frame_count - end_frame > max_time_lost`. Returning
+            # here froze the tracker's clock whenever the scene was empty, so
+            # lost tracks survived indefinitely and were re-matched to whoever
+            # appeared next. Matters most for a live camera on an empty scene.
+            #
+            # Deliberately NOT routed through _assign_tracks_to_detections:
+            # with zero detections and one or more live tracks, its np.argmax
+            # over an empty IoU matrix raises ValueError.
+            self._tracker_update(np.empty((0, 6), dtype=np.float32), frame)
+            return np.empty((0,), dtype=np.int32)
 
         if confidences is None or len(confidences) != len(xyxy):
             confidences = np.ones((len(xyxy),), dtype=np.float32)

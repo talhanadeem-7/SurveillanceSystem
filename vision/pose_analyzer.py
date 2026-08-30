@@ -1,7 +1,67 @@
+import logging
+import threading
+
 import cv2
 import numpy as np
 import torch
 import config
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# MiDaS process-wide singleton
+# ---------------------------------------------------------------------------
+# The depth model and its transform are stateless and identical for every run,
+# but PoseAnalyzer is constructed once per run_surveillance() call because it
+# holds PER-RUN state (the ORB reference frame, the Kalman filter dicts). That
+# meant a full torch.hub.load on every single run.
+#
+# Loaded lazily on first use and cached here, keyed by (model type, device), so
+# switching config.DEPTH_MODEL_TYPE still works. PoseAnalyzer stays constructible
+# per run; it just borrows the shared model instead of reloading it.
+_MIDAS_CACHE: dict = {}
+_MIDAS_LOCK = threading.Lock()      # Streamlit reruns can overlap in threads
+
+
+def get_midas(model_type: str | None = None):
+    """
+    Return (device, model, transform) for the requested MiDaS variant.
+
+    First call loads and caches; later calls are a dict lookup. Safe to call
+    from multiple threads — the lock prevents two concurrent torch.hub.load
+    calls for the same key.
+    """
+    if model_type is None:
+        model_type = config.DEPTH_MODEL_TYPE
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    key = (model_type, str(device))
+
+    cached = _MIDAS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    with _MIDAS_LOCK:
+        cached = _MIDAS_CACHE.get(key)      # re-check inside the lock
+        if cached is not None:
+            return cached
+
+        logger.info("Loading MiDaS depth model %s on %s (first use)", model_type, device)
+        print("Loading MiDaS Depth Model...")
+        model = torch.hub.load("intel-isl/MiDaS", model_type)
+        model.to(device)
+        model.eval()
+
+        transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        if model_type in ("DPT_Large", "DPT_Hybrid"):
+            transform = transforms.dpt_transform
+        else:
+            transform = transforms.small_transform
+
+        print("MiDaS Model Loaded Successfully.")
+        _MIDAS_CACHE[key] = (device, model, transform)
+        return _MIDAS_CACHE[key]
+
 
 class KalmanSmoother:  # stop the "3D boxes" from flickering or jumping around.
     def __init__(self, process_noise=0.005, measurement_noise=0.3):
@@ -30,28 +90,31 @@ class PoseAnalyzer:
         self.ref_frame = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
         
         # ORB Fingerprinting: It takes a "fingerprint" of the room's background. It remembers where corners and edges are./HEATMAP
-        self.orb = cv2.ORB_create(nfeatures=1000)
+        self.orb = cv2.ORB_create(
+            nfeatures=int(getattr(config, "ZONE_ALIGN_NFEATURES", 1000))
+        )
         self.ref_kp, self.ref_des = self.orb.detectAndCompute(self.ref_frame, None)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        # MiDaS Loading: It downloads the AI model that understands 3D distance
-        print("Loading MiDaS Depth Model...")
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        
-        self.depth_model = torch.hub.load("intel-isl/MiDaS", config.DEPTH_MODEL_TYPE)
-        self.depth_model.to(self.device)
-        self.depth_model.eval()
+        # --- zone-alignment gating state (see align_zones) ---
+        self._align_calls = 0            # processed frames seen by align_zones
+        self._last_homography = None     # last successfully computed M
+        self.align_consecutive_failures = 0
+        self.align_failures_total = 0
+        self.align_recomputes = 0
 
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        if config.DEPTH_MODEL_TYPE == "DPT_Large" or config.DEPTH_MODEL_TYPE == "DPT_Hybrid":
-            self.depth_transform = midas_transforms.dpt_transform
-        else:
-            self.depth_transform = midas_transforms.small_transform
+        # MiDaS: borrowed from the process-wide singleton above, NOT reloaded.
+        # First PoseAnalyzer in the process pays the torch.hub.load cost; every
+        # later run reuses the same model and transform.
+        self.device, self.depth_model, self.depth_transform = get_midas()
 
-        print("MiDaS Model Loaded Successfully.")
-        
         # 3. Kalman State Memory
-        self.person_depth_filters = {} 
+        # NOTE: both dicts grow without bound. person_depth_filters is keyed
+        # f"{person_id}_{zone_type}_{kp_idx}", so every distinct track id that
+        # reaches a zone adds entries that are never pruned. Per-run only (a new
+        # PoseAnalyzer is built each run), so it is bounded by one run's track
+        # count — but a long live-camera run in Phase 2 would grow indefinitely.
+        self.person_depth_filters = {}
         self.zone_depth_filters = {}
 
     def get_depth_map(self, frame):  # Converts a flat photo into a 3D map.
@@ -163,45 +226,92 @@ class PoseAnalyzer:
         return False
 
     # Fixes the boxes if the camera is bumped or moved.
-    def align_zones(self, frame, zones):
-        """ 
-        Compares current frame to the STARTING frame. 
-        Ensures the box/polygon stays exactly where it was drawn on the background.
+    def _compute_homography(self, frame):
+        """
+        ORB + BFMatcher + RANSAC against the reference frame.
+
+        Returns (M, reason). M is None on failure and `reason` says why, so the
+        caller can log a camera that has drifted out of match range instead of
+        failing silently.
         """
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         kp, des = self.orb.detectAndCompute(curr_gray, None)
-        
-        if des is None or self.ref_des is None:
-            return zones
+
+        if des is None:
+            return None, "no descriptors in current frame"
+        if self.ref_des is None:
+            return None, "no descriptors in reference frame"
 
         matches = self.bf.match(self.ref_des, des)
         matches = sorted(matches, key=lambda x: x.distance)
 
-        if len(matches) > 10:
-            src_pts = np.float32([self.ref_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        if len(matches) <= 10:
+            return None, f"only {len(matches)} matches (need >10)"
 
-            # Find the Transformation Matrix (Homography)
-            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        src_pts = np.float32([self.ref_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
-            if M is not None:
-                for z in zones:
-                    # --- CASE A: RESTRICTED (RECTANGLES) ---
-                    if z['type'] == 'restricted':
-                        x1, y1, x2, y2 = z['orig_coords']
-                        pts_z = np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]).reshape(-1, 1, 2)
-                        dst = cv2.perspectiveTransform(pts_z, M)
+        M, _mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if M is None:
+            return None, f"RANSAC found no homography from {len(matches)} matches"
+        return M, None
+
+    def align_zones(self, frame, zones):
+        """
+        Compares current frame to the STARTING frame.
+        Ensures the box/polygon stays exactly where it was drawn on the background.
+
+        Gated by config.ZONE_ALIGN_ENABLED / ZONE_ALIGN_INTERVAL: the homography
+        is recomputed only every Nth processed frame and reused in between, since
+        this is the most expensive stage in the pipeline. The interval counter
+        lives here rather than in the caller because this object already owns the
+        ORB reference state.
+        """
+        if not getattr(config, "ZONE_ALIGN_ENABLED", True):
+            return zones
+
+        self._align_calls += 1
+        interval = max(1, int(getattr(config, "ZONE_ALIGN_INTERVAL", 15)))
+
+        # Recompute on the first call and every Nth thereafter; also recompute
+        # if we have never yet succeeded, so a failed first frame keeps retrying.
+        due = ((self._align_calls - 1) % interval == 0) or self._last_homography is None
+        if due:
+            self.align_recomputes += 1
+            M, reason = self._compute_homography(frame)
+            if M is None:
+                self.align_failures_total += 1
+                self.align_consecutive_failures += 1
+                logger.warning(
+                    "align_zones: homography recompute failed at processed frame "
+                    "%d (%s); reusing previous alignment "
+                    "(consecutive failures=%d, total=%d)",
+                    self._align_calls, reason,
+                    self.align_consecutive_failures, self.align_failures_total,
+                )
+            else:
+                self._last_homography = M
+                self.align_consecutive_failures = 0
+
+        M = self._last_homography
+        if M is not None:
+            for z in zones:
+                # --- CASE A: RESTRICTED (RECTANGLES) ---
+                if z['type'] == 'restricted':
+                    x1, y1, x2, y2 = z['orig_coords']
+                    pts_z = np.float32([[x1, y1], [x2, y1], [x2, y2], [x1, y2]]).reshape(-1, 1, 2)
+                    dst = cv2.perspectiveTransform(pts_z, M)
                         
-                        z['coords'] = (int(dst[:,0,0].min()), int(dst[:,0,1].min()), int(dst[:,0,0].max()), int(dst[:,0,1].max()))
+                    z['coords'] = (int(dst[:,0,0].min()), int(dst[:,0,1].min()), int(dst[:,0,0].max()), int(dst[:,0,1].max()))
                     
-                    # --- CASE B: PASSIVE (POLYGONS) ---
-                    elif z['type'] == 'passive' and 'polygon' in z:
+                # --- CASE B: PASSIVE (POLYGONS) ---
+                elif z['type'] == 'passive' and 'polygon' in z:
                         
-                        if 'orig_polygon' not in z:
-                            z['orig_polygon'] = np.array(z['polygon'], dtype=np.float32).reshape(-1, 1, 2)
+                    if 'orig_polygon' not in z:
+                        z['orig_polygon'] = np.array(z['polygon'], dtype=np.float32).reshape(-1, 1, 2)
                         
-                        dst_poly = cv2.perspectiveTransform(z['orig_polygon'], M)
-                        z['polygon'] = dst_poly.astype(np.int32)
+                    dst_poly = cv2.perspectiveTransform(z['orig_polygon'], M)
+                    z['polygon'] = dst_poly.astype(np.int32)
 
         return zones
 

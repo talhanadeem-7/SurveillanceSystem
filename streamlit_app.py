@@ -227,7 +227,20 @@ def run_surveillance():
     # --- PERFORMANCE: process every Nth frame (skip frames) ---
     # At 30 fps native, FRAME_SKIP=2 means we run inference at ~15 fps,
     # which is plenty for surveillance while halving GPU load.
-    FRAME_SKIP = 2   # increase to 3 for weaker hardware
+    #
+    # FRAME_SKIP=3 was MEASURED AND REJECTED — do not re-propose it without new
+    # evidence. It reaches live-camera real time (>=30 source fps) on only one of
+    # three clips (office cctv 31.93, crowd sample 27.86, crowded sample2 25.23),
+    # and it buys that by dropping the tracker's update rate from 15 Hz to 10 Hz:
+    # the VF-13 regression split moves from frames 429/450 to 286/342 and median
+    # track life falls on all three clips (147->100, 23->15, 40->31). For a system
+    # whose purpose is attributing events to specific people, that is the wrong
+    # trade. See CLAUDE.md VF-38/VF-39.
+    #
+    # Note also that cap.read() runs on EVERY source frame regardless of skipping,
+    # so FRAME_SKIP saves inference time but not decode time. Decode is a Phase 2
+    # reader-thread problem, not a FRAME_SKIP tuning problem.
+    FRAME_SKIP = 2
 
     # --- PERFORMANCE: downscale inference resolution ---
     # We detect at a smaller size and draw on the original frame.
@@ -243,381 +256,460 @@ def run_surveillance():
     target_display_interval = 1.0 / min(native_fps / FRAME_SKIP, 30.0)
     last_display_time = 0.0
 
-    while cap.isOpened() and not stop_btn:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_id += 1
+    # --- ROBUSTNESS: per-frame error handling -------------------------
+    # One bad frame must not kill an entire run. On file playback that costs
+    # a run; against a live camera it means surveillance stops overnight on a
+    # single corrupt frame and nobody notices until morning.
+    MAX_CONSECUTIVE_FAILURES = 30   # 30 in a row is systemic, not a bad frame
+    consecutive_failures = 0
+    total_failures = 0
+    aborted_reason = None
 
-        # --- FRAME SKIP: forward-read to maintain real-time pace ---
-        if frame_id % FRAME_SKIP != 0:
-            continue
-
-        # --- DOWNSCALE for inference, keep original for drawing ---
-        orig_h, orig_w = frame.shape[:2]
-        scale = INFERENCE_WIDTH / orig_w
-        if scale < 1.0:                         # only shrink, never upscale
-            infer_frame = cv2.resize(
-                frame, (INFERENCE_WIDTH, int(orig_h * scale)),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        else:
-            infer_frame = frame                 # already small enough
-
-        # A. Align Zones (Homography)
-        zones = analyzer.align_zones(frame, zones)
-
-        # B. Run YOLO on the (possibly downscaled) inference frame.
-        results = st.session_state.detector.track_and_detect(infer_frame)
-
-        # Scale detections back to original resolution so downstream zone
-        # logic, face crops, and skeleton drawing stay in one coordinate space.
-        # We clone() first because YOLO returns inference-mode tensors which
-        # do not allow in-place operations (PyTorch InferenceMode restriction).
-        if results.boxes is not None and scale < 1.0:
-            # xyxy is a read-only property — scale the underlying .data tensor.
-            # Boxes.data format: [x1, y1, x2, y2, (track_id,) conf, cls]
-            boxes_data = results.boxes.data.clone()
-            boxes_data[:, [0, 2]] /= scale   # x-coords
-            boxes_data[:, [1, 3]] /= scale   # y-coords
-            results.boxes.data = boxes_data
-
-            if results.keypoints is not None and results.keypoints.data is not None:
-                kpts_data = results.keypoints.data.clone()
-                kpts_data[:, :, 0] /= scale  # x-coords
-                kpts_data[:, :, 1] /= scale  # y-coords
-                results.keypoints.data = kpts_data
-
-        # --- CONDITIONAL DEPTH ---
-        #  It checks if any person is visually overlapping a zone box in 2D.
-        # This block ensures we only turn on the "Depth Brain" (MiDaS) if someone is actually close to a zone. If everyone is far away, we skip this to save speed.
-        depth_map = None
-        needs_depth = False
-        if results.boxes is not None:
-            for i in range(len(results.boxes)):
-                bbox = results.boxes.xyxy[i].cpu().numpy()
-                if analyzer.check_2d_overlap(bbox, zones):
-                    needs_depth = True
+    try:
+        while cap.isOpened() and not stop_btn:
+            try:
+                ret, frame = cap.read()
+                if not ret:
                     break
+                frame_id += 1
 
-        if needs_depth:
-            should_refresh_depth = (
-                last_depth_map is None
-                or frame_id % DEPTH_REFRESH_INTERVAL == 0
-            )
-            if should_refresh_depth:
-                last_depth_map = analyzer.get_depth_map(frame)
-            depth_map = last_depth_map
+                # --- FRAME SKIP: forward-read to maintain real-time pace ---
+                if frame_id % FRAME_SKIP != 0:
+                    continue
 
-        # Reset labels
-        for z in zones:
-            if z["type"] == "restricted":
-                z["status"], z["color"] = "SECURE", config.COLOR_SECURE
+                # --- DOWNSCALE for inference, keep original for drawing ---
+                orig_h, orig_w = frame.shape[:2]
+                scale = INFERENCE_WIDTH / orig_w
+                if scale < 1.0:                         # only shrink, never upscale
+                    infer_frame = cv2.resize(
+                        frame, (INFERENCE_WIDTH, int(orig_h * scale)),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                else:
+                    infer_frame = frame                 # already small enough
 
-        person_statuses = []
-        anybody_overlapping_2d = False
+                # A. Align Zones (Homography)
+                zones = analyzer.align_zones(frame, zones)
 
-        if results.boxes is not None and results.boxes.id is not None:
-            ids = results.boxes.id.cpu().numpy().astype(int)
+                # B. Run YOLO on the (possibly downscaled) inference frame.
+                results = st.session_state.detector.track_and_detect(infer_frame)
 
+                # Scale detections back to original resolution so downstream zone
+                # logic, face crops, and skeleton drawing stay in one coordinate space.
+                # We clone() first because YOLO returns inference-mode tensors which
+                # do not allow in-place operations (PyTorch InferenceMode restriction).
+                if results.boxes is not None and scale < 1.0:
+                    # xyxy is a read-only property — scale the underlying .data tensor.
+                    # Boxes.data format: [x1, y1, x2, y2, (track_id,) conf, cls]
+                    boxes_data = results.boxes.data.clone()
+                    boxes_data[:, [0, 2]] /= scale   # x-coords
+                    boxes_data[:, [1, 3]] /= scale   # y-coords
+                    results.boxes.data = boxes_data
 
-            for i in range(len(results.boxes)):
-                current_id = ids[i]
-                bbox = results.boxes.xyxy[i].cpu().numpy()
-                kpts = results[i].keypoints
+                    if results.keypoints is not None and results.keypoints.data is not None:
+                        kpts_data = results.keypoints.data.clone()
+                        kpts_data[:, :, 0] /= scale  # x-coords
+                        kpts_data[:, :, 1] /= scale  # y-coords
+                        results.keypoints.data = kpts_data
 
-                # --- HEATMAP: record foot position for this track ---
-                record_position(
-                    st.session_state.track_positions,
-                    current_id,
-                    bbox,
-                    frame_id,
-                )
-
-                # --- A. DETERMINE CURRENT LOCATION (Passive Context) ---
-                #  It checks where the person is standing.
-                current_loc = "General Area" 
-                passive_zones = [z for z in zones if z["type"] == "passive"]
-
-                if analyzer.check_trespassing(
-                    kpts, bbox, passive_zones, depth_map, person_id=current_id
-                ):
-                    for z in passive_zones:
-                        fx = (kpts.xy[0][15][0] + kpts.xy[0][16][0]) / 2
-                        fy = (kpts.xy[0][15][1] + kpts.xy[0][16][1]) / 2
-                        foot_x, foot_y = (int(fx), int(fy))
-                        if cv2.pointPolygonTest(
-                            z["polygon"], (foot_x, foot_y), False
-                        ) >= 0:
-                            current_loc = z["name"]
+                # --- CONDITIONAL DEPTH ---
+                #  It checks if any person is visually overlapping a zone box in 2D.
+                # This block ensures we only turn on the "Depth Brain" (MiDaS) if someone is actually close to a zone. If everyone is far away, we skip this to save speed.
+                depth_map = None
+                needs_depth = False
+                if results.boxes is not None:
+                    for i in range(len(results.boxes)):
+                        bbox = results.boxes.xyxy[i].cpu().numpy()
+                        if analyzer.check_2d_overlap(bbox, zones):
+                            needs_depth = True
                             break
 
-                # --- B. 1. FACE RECOGNITION ---
-                #  Every 30 frames, it checks the person's face against the database. If recognized, it updates their name from "Person_1" to "Talha."
-                display_name = f"Person_{current_id}"
-                is_authorized = False
+                if needs_depth:
+                    should_refresh_depth = (
+                        last_depth_map is None
+                        or frame_id % DEPTH_REFRESH_INTERVAL == 0
+                    )
+                    if should_refresh_depth:
+                        last_depth_map = analyzer.get_depth_map(frame)
+                    depth_map = last_depth_map
 
-                if current_id not in unknown_check_counters:
-                    unknown_check_counters[current_id] = 0
-                if current_id not in face_candidate_state:
-                    face_candidate_state[current_id] = {"name": None, "count": 0}
-                if current_id not in identity_revalidation_state:
-                    identity_revalidation_state[current_id] = {"fails": 0}
-
-                if current_id in identity_map:
-                    mapped_name = identity_map[current_id]
-                    display_name = mapped_name
-                    is_authorized = True
-
-                    if (
-                        unknown_check_counters[current_id]
-                        % config.FACE_REVALIDATE_INTERVAL
-                        == 0
-                    ):
-                        face_crop = (
-                            st.session_state.face_recognizer.extract_face_crop(
-                                frame, kpts
-                            )
-                        )
-                        recheck_name = None
-                        if face_crop is not None:
-                            recheck_name = (
-                                st.session_state.face_recognizer.identify_person(
-                                    face_crop
-                                )
-                            )
-
-                        if recheck_name == mapped_name:
-                            # Confirmed: still the same person.
-                            identity_revalidation_state[current_id]["fails"] = 0
-                        elif recheck_name is None:
-                            # No face visible this check (turned away, out of
-                            # frame, poor angle) or no confident match - this is
-                            # inconclusive, NOT a contradiction. A locked identity
-                            # should not erode just because the face was briefly
-                            # unobservable, so leave the fail counter untouched.
-                            pass
-                        else:
-                            # A DIFFERENT enrolled identity was confidently
-                            # matched on this track - a genuine mismatch signal
-                            # (e.g. an ID/track swap), so this still counts.
-                            identity_revalidation_state[current_id]["fails"] += 1
-                            if (
-                                identity_revalidation_state[current_id]["fails"]
-                                >= config.FACE_REVALIDATION_FAILS
-                            ):
-                                identity_map.pop(current_id, None)
-                                face_candidate_state[current_id] = {
-                                    "name": None,
-                                    "count": 0,
-                                }
-                                identity_revalidation_state[current_id]["fails"] = 0
-                                display_name = f"Person_{current_id}"
-                                is_authorized = False
-                                st.session_state.logger._write_to_csv_and_terminal(
-                                    f"Person_{current_id}",
-                                    "Identity",
-                                    f"Revoked {mapped_name} (mismatch)",
-                                    current_loc,
-                                )
-                else:
-                    if (
-                        unknown_check_counters[current_id]
-                        % config.FACE_CHECK_INTERVAL
-                        == 0
-                    ):
-                        face_crop = (
-                            st.session_state.face_recognizer.extract_face_crop(
-                                frame, kpts
-                            )
-                        )
-                        if face_crop is not None:
-                            found_name = (
-                                st.session_state.face_recognizer.identify_person(
-                                    face_crop
-                                )
-                            )
-                            candidate = face_candidate_state[current_id]
-
-                            if found_name:
-                                if candidate["name"] == found_name:
-                                    candidate["count"] += 1
-                                else:
-                                    candidate["name"] = found_name
-                                    candidate["count"] = 1
-
-                                if candidate["count"] >= config.FACE_CONFIRMATION_REQUIRED:
-                                    identity_map[current_id] = found_name
-                                    display_name = found_name
-                                    is_authorized = True
-
-                                    st.session_state.logger._write_to_csv_and_terminal(
-                                        f"Person_{current_id}",
-                                        "Identity",
-                                        f"Recognized as {found_name}",
-                                        current_loc,
-                                    )
-
-                                    behavior_logged_ids.add(found_name)
-                                    logged_general_ids.add(found_name)
-                            else:
-                                candidate["name"] = None
-                                candidate["count"] = 0
-
-                unknown_check_counters[current_id] += 1
-
-                person_location_state[current_id] = current_loc
-
-                # --- E. GLOBAL PERSISTENCE ---
-                raw_is_tres = analyzer.check_trespassing(
-                    kpts,
-                    bbox,
-                    [z for z in zones if z["type"] == "restricted"],
-                    depth_map,
-                    person_id=current_id,
-                )
-
-                if current_id not in intrusion_persistence:
-                    intrusion_persistence[current_id] = 0
-
-                if raw_is_tres:
-                    intrusion_persistence[current_id] += 1
-                else:
-                    intrusion_persistence[current_id] = 0
-
-                confirmed_tres = (
-                    intrusion_persistence[current_id] >= PERSISTENCE_THRESHOLD
-                )
-                person_statuses.append(confirmed_tres)
-
-                is_overlap = analyzer.check_2d_overlap(
-                    bbox, [z for z in zones if z["type"] == "restricted"]
-                )
-                if is_overlap:
-                    anybody_overlapping_2d = True
-
-                # --- F. ZONE-SPECIFIC LOGIC ---
-                # If an unauthorized person touches a Restricted Zone for a few frames, it triggers an "Intrusion" alert.
+                # Reset labels
                 for z in zones:
                     if z["type"] == "restricted":
-                        this_zone_tres = analyzer.check_trespassing(
-                            kpts, bbox, [z], depth_map, person_id=current_id
-                        )
+                        z["status"], z["color"] = "SECURE", config.COLOR_SECURE
 
-                        if this_zone_tres and confirmed_tres:
-                            z["last_interactor"] = display_name
-                            person_location_state[current_id] = z["name"]
+                person_statuses = []
+                anybody_overlapping_2d = False
 
-                            if is_authorized:
-                                z["status"] = "AUTHORIZED ACCESS"
-                                z["color"] = config.COLOR_AUTHORIZED
-                                st.session_state.logger.log_event(
-                                    display_name,
-                                    "Access",
-                                    "AUTHORIZED",
-                                    True,
-                                    location=z["name"],
-                                )
-                            else:
-                                z["status"] = "UNAUTHORIZED ACCESS"
-                                z["color"] = config.COLOR_UNAUTHORIZED
-                                st.session_state.logger.log_event(
-                                    display_name,
-                                    "Intrusion",
-                                    "UNAUTHORIZED",
-                                    True,
-                                    location=z["name"],
-                                )
+                if results.boxes is not None and results.boxes.id is not None:
+                    ids = results.boxes.id.cpu().numpy().astype(int)
 
-            results.is_trespassing = person_statuses
 
-        # --- G. Theft Detection ---
-        # It checks if an object has disappeared.
-        # runs only when people move away (no overlap). It compares the "Edge Density" of the zone now vs. the beginning. If the edges are gone (laptop missing), it triggers a Theft alert. It checks who the last person was to decide if it was "Stolen" (Stranger) or "Removed" (Authorized Person).
-        if not anybody_overlapping_2d:
-            for z in zones:
-                if z["type"] == "restricted":
-                    is_theft = analyzer.detect_theft(frame, z)
-                    zone_name = z["name"]
+                    for i in range(len(results.boxes)):
+                        current_id = ids[i]
+                        bbox = results.boxes.xyxy[i].cpu().numpy()
+                        kpts = results[i].keypoints
 
-                    if is_theft:
-                        last_user = z["last_interactor"]
-                        last_user_is_authorized = (
-                            last_user in identity_map.values()
-                            if last_user
-                            else False
-                        )
+                        # Detections the tracker could not match carry a unique
+                        # negative id from PoseDetector. They are EPHEMERAL: the same
+                        # person may get a different id next frame, so they must never
+                        # key any cross-frame state. They are still drawn and still
+                        # evaluated against zones for THIS frame; they simply cannot
+                        # accumulate persistence, identity or trajectory history.
+                        is_ephemeral = current_id < 0
 
-                        if last_user_is_authorized:
-                            z["status"] = f"REMOVED BY {last_user}"
-                            z["color"] = config.COLOR_AUTHORIZED
-                            st.session_state.logger.log_event(
-                                "ASSET",
-                                "Removal",
-                                f"BY_{last_user}",
-                                True,
-                                location=zone_name,
+                        # --- HEATMAP: record foot position for this track ---
+                        if not is_ephemeral:
+                            record_position(
+                                st.session_state.track_positions,
+                                current_id,
+                                bbox,
+                                frame_id,
                             )
+
+                        # --- A. DETERMINE CURRENT LOCATION (Passive Context) ---
+                        #  It checks where the person is standing.
+                        current_loc = "General Area" 
+                        passive_zones = [z for z in zones if z["type"] == "passive"]
+
+                        if analyzer.check_trespassing(
+                            kpts, bbox, passive_zones, depth_map, person_id=current_id
+                        ):
+                            for z in passive_zones:
+                                fx = (kpts.xy[0][15][0] + kpts.xy[0][16][0]) / 2
+                                fy = (kpts.xy[0][15][1] + kpts.xy[0][16][1]) / 2
+                                foot_x, foot_y = (int(fx), int(fy))
+                                if cv2.pointPolygonTest(
+                                    z["polygon"], (foot_x, foot_y), False
+                                ) >= 0:
+                                    current_loc = z["name"]
+                                    break
+
+                        # --- B. 1. FACE RECOGNITION ---
+                        #  Every 30 frames, it checks the person's face against the database. If recognized, it updates their name from "Person_1" to "Talha."
+                        display_name = f"Person_{current_id}"
+                        is_authorized = False
+
+                        # Face recognition keys ALL of its state by track id, so it is
+                        # skipped for ephemeral detections. They keep the default
+                        # Person_<id> label and are never treated as authorized.
+                        if not is_ephemeral:
+                            if current_id not in unknown_check_counters:
+                                unknown_check_counters[current_id] = 0
+                            if current_id not in face_candidate_state:
+                                face_candidate_state[current_id] = {"name": None, "count": 0}
+                            if current_id not in identity_revalidation_state:
+                                identity_revalidation_state[current_id] = {"fails": 0}
+
+                        if not is_ephemeral and current_id in identity_map:
+                            mapped_name = identity_map[current_id]
+                            display_name = mapped_name
+                            is_authorized = True
+
+                            if (
+                                unknown_check_counters[current_id]
+                                % config.FACE_REVALIDATE_INTERVAL
+                                == 0
+                            ):
+                                face_crop = (
+                                    st.session_state.face_recognizer.extract_face_crop(
+                                        frame, kpts
+                                    )
+                                )
+                                recheck_name = None
+                                if face_crop is not None:
+                                    recheck_name = (
+                                        st.session_state.face_recognizer.identify_person(
+                                            face_crop
+                                        )
+                                    )
+
+                                if recheck_name == mapped_name:
+                                    # Confirmed: still the same person.
+                                    identity_revalidation_state[current_id]["fails"] = 0
+                                elif recheck_name is None:
+                                    # No face visible this check (turned away, out of
+                                    # frame, poor angle) or no confident match - this is
+                                    # inconclusive, NOT a contradiction. A locked identity
+                                    # should not erode just because the face was briefly
+                                    # unobservable, so leave the fail counter untouched.
+                                    pass
+                                else:
+                                    # A DIFFERENT enrolled identity was confidently
+                                    # matched on this track - a genuine mismatch signal
+                                    # (e.g. an ID/track swap), so this still counts.
+                                    identity_revalidation_state[current_id]["fails"] += 1
+                                    if (
+                                        identity_revalidation_state[current_id]["fails"]
+                                        >= config.FACE_REVALIDATION_FAILS
+                                    ):
+                                        identity_map.pop(current_id, None)
+                                        face_candidate_state[current_id] = {
+                                            "name": None,
+                                            "count": 0,
+                                        }
+                                        identity_revalidation_state[current_id]["fails"] = 0
+                                        display_name = f"Person_{current_id}"
+                                        is_authorized = False
+                                        st.session_state.logger._write_to_csv_and_terminal(
+                                            f"Person_{current_id}",
+                                            "Identity",
+                                            f"Revoked {mapped_name} (mismatch)",
+                                            current_loc,
+                                        )
+                        elif not is_ephemeral:
+                            if (
+                                unknown_check_counters[current_id]
+                                % config.FACE_CHECK_INTERVAL
+                                == 0
+                            ):
+                                face_crop = (
+                                    st.session_state.face_recognizer.extract_face_crop(
+                                        frame, kpts
+                                    )
+                                )
+                                if face_crop is not None:
+                                    found_name = (
+                                        st.session_state.face_recognizer.identify_person(
+                                            face_crop
+                                        )
+                                    )
+                                    candidate = face_candidate_state[current_id]
+
+                                    if found_name:
+                                        if candidate["name"] == found_name:
+                                            candidate["count"] += 1
+                                        else:
+                                            candidate["name"] = found_name
+                                            candidate["count"] = 1
+
+                                        if candidate["count"] >= config.FACE_CONFIRMATION_REQUIRED:
+                                            identity_map[current_id] = found_name
+                                            display_name = found_name
+                                            is_authorized = True
+
+                                            st.session_state.logger._write_to_csv_and_terminal(
+                                                f"Person_{current_id}",
+                                                "Identity",
+                                                f"Recognized as {found_name}",
+                                                current_loc,
+                                            )
+
+                                            behavior_logged_ids.add(found_name)
+                                            logged_general_ids.add(found_name)
+                                    else:
+                                        candidate["name"] = None
+                                        candidate["count"] = 0
+
+                        if not is_ephemeral:
+                            unknown_check_counters[current_id] += 1
+                            person_location_state[current_id] = current_loc
+
+                        # --- E. GLOBAL PERSISTENCE ---
+                        raw_is_tres = analyzer.check_trespassing(
+                            kpts,
+                            bbox,
+                            [z for z in zones if z["type"] == "restricted"],
+                            depth_map,
+                            person_id=current_id,
+                        )
+
+                        if is_ephemeral:
+                            # Persistence needs a stable id across frames. An ephemeral
+                            # detection is evaluated for this frame only and can never
+                            # reach PERSISTENCE_THRESHOLD, so it is never logged.
+                            confirmed_tres = False
                         else:
-                            z["status"] = "THEFT DETECTED"
-                            z["color"] = config.COLOR_THEFT
-                            st.session_state.logger.log_event(
-                                "ASSET",
-                                "Theft",
-                                "STOLEN",
-                                True,
-                                location=zone_name,
+                            if current_id not in intrusion_persistence:
+                                intrusion_persistence[current_id] = 0
+
+                            if raw_is_tres:
+                                intrusion_persistence[current_id] += 1
+                            else:
+                                intrusion_persistence[current_id] = 0
+
+                            confirmed_tres = (
+                                intrusion_persistence[current_id] >= PERSISTENCE_THRESHOLD
                             )
-                    else:
-                        st.session_state.logger.log_event(
-                            "ASSET",
-                            "Theft",
-                            "STOLEN",
-                            False,
-                            location=zone_name,
+                        person_statuses.append(confirmed_tres)
+
+                        is_overlap = analyzer.check_2d_overlap(
+                            bbox, [z for z in zones if z["type"] == "restricted"]
                         )
-                        st.session_state.logger.log_event(
-                            "ASSET",
-                            "Removal",
-                            "BY_AUTH",
-                            False,
-                            location=zone_name,
-                        )
+                        if is_overlap:
+                            anybody_overlapping_2d = True
 
-        # --- H. RENDERING AND UI UPDATES ---
-        draw_surveillance_ui(frame, results, zones, identity_map)
+                        # --- F. ZONE-SPECIFIC LOGIC ---
+                        # If an unauthorized person touches a Restricted Zone for a few frames, it triggers an "Intrusion" alert.
+                        for z in zones:
+                            if z["type"] == "restricted":
+                                this_zone_tres = analyzer.check_trespassing(
+                                    kpts, bbox, [z], depth_map, person_id=current_id
+                                )
 
-        # --- PERFORMANCE: throttle display — only push frame to browser
-        # at the target rate.  Heavy inference can run every loop tick,
-        # but st.image() is expensive; skipping a render never drops a frame
-        # from the analysis, just from the preview.
-        now = time.time()
-        if now - last_display_time >= target_display_interval:
-            frame_placeholder.image(
-                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                channels="RGB",
-                use_column_width=True,
-            )
-            # Show IdentityGuardian live stats in the status panel
-            guardian_stats = st.session_state.detector.guardian.get_stats()
-            status_text.markdown(
-                f"**Frame:** {frame_id}\n\n"
-                f"**Known Identities:** {guardian_stats['known_identities']}\n\n"
-                f"**ID Corrections:** {guardian_stats['active_remaps']}\n\n"
-                f"**Retired IDs:** {guardian_stats['retired_ids']}"
-            )
-            last_display_time = now
+                                if this_zone_tres and confirmed_tres:
+                                    z["last_interactor"] = display_name
+                                    person_location_state[current_id] = z["name"]
 
-        st.session_state.logger.update_logs()
+                                    if is_authorized:
+                                        z["status"] = "AUTHORIZED ACCESS"
+                                        z["color"] = config.COLOR_AUTHORIZED
+                                        st.session_state.logger.log_event(
+                                            display_name,
+                                            "Access",
+                                            "AUTHORIZED",
+                                            True,
+                                            location=z["name"],
+                                        )
+                                    else:
+                                        z["status"] = "UNAUTHORIZED ACCESS"
+                                        z["color"] = config.COLOR_UNAUTHORIZED
+                                        st.session_state.logger.log_event(
+                                            display_name,
+                                            "Intrusion",
+                                            "UNAUTHORIZED",
+                                            True,
+                                            location=z["name"],
+                                        )
 
-        if stop_btn:
-            break
+                    results.is_trespassing = person_statuses
 
-    cap.release()
-    st.session_state.processing_complete = True
-    st.success(
-        "✅ Surveillance Processing Finished. You can now use the 'Shelby Analyst' tab."
-    )
+                # --- G. Theft Detection ---
+                # It checks if an object has disappeared.
+                # runs only when people move away (no overlap). It compares the "Edge Density" of the zone now vs. the beginning. If the edges are gone (laptop missing), it triggers a Theft alert. It checks who the last person was to decide if it was "Stolen" (Stranger) or "Removed" (Authorized Person).
+                if not anybody_overlapping_2d:
+                    for z in zones:
+                        if z["type"] == "restricted":
+                            is_theft = analyzer.detect_theft(frame, z)
+                            zone_name = z["name"]
+
+                            if is_theft:
+                                last_user = z["last_interactor"]
+                                last_user_is_authorized = (
+                                    last_user in identity_map.values()
+                                    if last_user
+                                    else False
+                                )
+
+                                if last_user_is_authorized:
+                                    z["status"] = f"REMOVED BY {last_user}"
+                                    z["color"] = config.COLOR_AUTHORIZED
+                                    st.session_state.logger.log_event(
+                                        "ASSET",
+                                        "Removal",
+                                        f"BY_{last_user}",
+                                        True,
+                                        location=zone_name,
+                                    )
+                                else:
+                                    z["status"] = "THEFT DETECTED"
+                                    z["color"] = config.COLOR_THEFT
+                                    st.session_state.logger.log_event(
+                                        "ASSET",
+                                        "Theft",
+                                        "STOLEN",
+                                        True,
+                                        location=zone_name,
+                                    )
+                            else:
+                                st.session_state.logger.log_event(
+                                    "ASSET",
+                                    "Theft",
+                                    "STOLEN",
+                                    False,
+                                    location=zone_name,
+                                )
+                                st.session_state.logger.log_event(
+                                    "ASSET",
+                                    "Removal",
+                                    "BY_AUTH",
+                                    False,
+                                    location=zone_name,
+                                )
+
+                # --- H. RENDERING AND UI UPDATES ---
+                draw_surveillance_ui(frame, results, zones, identity_map)
+
+                # --- PERFORMANCE: throttle display — only push frame to browser
+                # at the target rate.  Heavy inference can run every loop tick,
+                # but st.image() is expensive; skipping a render never drops a frame
+                # from the analysis, just from the preview.
+                now = time.time()
+                if now - last_display_time >= target_display_interval:
+                    frame_placeholder.image(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                        channels="RGB",
+                        use_column_width=True,
+                    )
+                    # Show IdentityGuardian live stats in the status panel
+                    guardian_stats = st.session_state.detector.guardian.get_stats()
+                    status_text.markdown(
+                        f"**Frame:** {frame_id}\n\n"
+                        f"**Known Identities:** {guardian_stats['known_identities']}\n\n"
+                        f"**ID Corrections:** {guardian_stats['active_remaps']}\n\n"
+                        f"**Retired IDs:** {guardian_stats['retired_ids']}"
+                    )
+                    last_display_time = now
+
+                st.session_state.logger.update_logs()
+
+                # Frame completed without raising -> reset the failure streak.
+                consecutive_failures = 0
+
+                if stop_btn:
+                    break
+            except (KeyboardInterrupt, SystemExit):
+                # Never swallow these — let the interpreter unwind. The finally
+                # block below still releases the capture handle.
+                raise
+            except Exception as exc:
+                total_failures += 1
+                consecutive_failures += 1
+                logging.exception(
+                    "run_surveillance: frame %d failed with %s "
+                    "(consecutive=%d, total=%d)",
+                    frame_id, type(exc).__name__,
+                    consecutive_failures, total_failures,
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    aborted_reason = (
+                        f"Aborted after {consecutive_failures} consecutive "
+                        f"frame failures at frame {frame_id}. Last error: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logging.error("run_surveillance: %s", aborted_reason)
+                    break
+                continue
+    finally:
+        # Always runs: normal end, abort path, and user interruption.
+        cap.release()
+        st.session_state.processing_complete = True
+
+    # Zone alignment health: a camera that has drifted out of ORB match range
+    # fails silently otherwise — the zones simply stop tracking the scene.
+    if getattr(analyzer, "align_failures_total", 0):
+        st.warning(
+            f"⚠️ Zone alignment failed on {analyzer.align_failures_total} of "
+            f"{analyzer.align_recomputes} recompute attempts "
+            f"(longest run of consecutive failures ended at "
+            f"{analyzer.align_consecutive_failures}). Zones reused the last good "
+            f"homography. Check the log for reasons."
+        )
+
+    if aborted_reason:
+        st.error(f"🛑 {aborted_reason}")
+    elif total_failures:
+        st.warning(
+            f"⚠️ Surveillance finished, but {total_failures} frame(s) were skipped "
+            f"due to errors. See the log for tracebacks."
+        )
+        st.success(
+            "✅ Surveillance Processing Finished. You can now use the 'Shelby Analyst' tab."
+        )
+    else:
+        st.success(
+            "✅ Surveillance Processing Finished. You can now use the 'Shelby Analyst' tab."
+        )
 
 
 def run_shelby_analyst():

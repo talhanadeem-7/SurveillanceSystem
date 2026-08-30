@@ -1,42 +1,42 @@
 # Computer Vision
-ultralytics>=8.0.0
-boxmot>=10.0.0          # StrongSORT tracker — requires Python 3.11 or 3.12
-opencv-python
+ultralytics==8.4.41
+boxmot==18.0.0          # StrongSORT tracker — requires Python 3.11 or 3.12
+opencv-python==4.11.0.86
 numpy==1.26.4           # boxmot hard-requires this exact numpy version
-torch
-torchvision
+torch==2.11.0
+torchvision==0.26.0
 
 # Data & Logging
-pandas
+pandas==2.3.3
 
 # AI & NLP (For the "Analyst" Phase)
-langchain
-langchain-google-genai
-chromadb
-python-dotenv
+langchain==1.2.15
+langchain-google-genai==4.2.2
+chromadb==1.5.8
+python-dotenv==1.2.2
 
 # Utilities
-tqdm
+tqdm==4.67.3
 
 # Midas Depth reasoning
-timm
+timm==1.0.26
 
 # Face recognition
-deepface
-tf-keras
+deepface==0.0.99
+tf-keras==2.15.0
 
-langchain
-langchain-community
-langchain-google-genai
-chromadb
-python-dotenv
-pydantic
-langchain-openai
+langchain==1.2.15
+langchain-community==0.4.1
+langchain-google-genai==4.2.2
+chromadb==1.5.8
+python-dotenv==1.2.2
+pydantic==2.13.3
+langchain-openai==1.2.1
 
 # ST-GCN
-einops
+einops==0.8.2
 
 # Frontend
-streamlit
-streamlit-drawable-canvas
-Pillow
+streamlit==1.38.0
+streamlit-drawable-canvas==0.9.3
+Pillow==10.4.0

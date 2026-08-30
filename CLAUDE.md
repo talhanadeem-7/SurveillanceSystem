@@ -40,9 +40,9 @@ invalidated several premises.
 | 1b — Empty-frame tracker freeze | **done** | Fixed in **both** `tracker.py` and `detector.py` (VF-23) — the tracker.py fix alone was provably insufficient. Empty scene now ages identically to a populated one (VF-24). office cctv now resolves to **6** tracks; ruled OQ-10 = accept 6, **VF-13 rule rewritten** (old value 5 was a freeze artefact, VF-25). Re-entry study re-measured post-fix (VF-27). |
 | 1a — Plumb `TRACKER_TRACK_BUFFER` + `TRACKER_MATCH_IOU_THRESHOLD` | **done** | Defaults 30 and 0.2, behaviour preserved; all three clips byte-identical after. `track_buffer` comment records VF-1 so nobody re-derives it; match-IoU comment records VF-8 (exposed for visibility, not a working lever). |
 | Guardian A/B — `IDENTITY_GUARDIAN_ENABLED`, default False | **done** | Flag added (default **False**), gated in `detector.py`; class left fully intact. Measured: Guardian is pure over-merge on these clips (VF-11/12/13), **but** OSNet alone cannot cover long gaps (VF-14) — see OQ-6. |
-| 2 — MiDaS module-level singleton | **NOT DONE — carried to Phase 2** | Never reached; the queue was reprioritised into tracker correctness. Still reloaded per `run_surveillance()` call via `PoseAnalyzer.__init__`. |
-| 3 — Gate `align_zones` (`ZONE_ALIGN_INTERVAL`=15, `ZONE_ALIGN_ENABLED`=True) | **NOT DONE — carried to Phase 2** | Never reached. ORB+RANSAC still runs every processed frame. |
-| 4 — Per-frame try/except in `run_surveillance` + `finally` release | **NOT DONE — carried to Phase 2** | Never reached. The main loop still has no error handling and no `finally`; one bad frame aborts the run, leaks `cap`, and never sets `processing_complete`. |
+| 2 — MiDaS module-level singleton | **done** | Lazy, thread-safe, keyed by (model type, device). Second run in-process: 3.34 s -> 0.015 s (VF-32). Per-run state unaffected. |
+| 3 — Gate `align_zones` | **done** | **`ZONE_ALIGN_ENABLED=False` (ruled)**, `ZONE_ALIGN_INTERVAL=15`, `ZONE_ALIGN_NFEATURES=1000` (unchanged default). Interval counter inside `PoseAnalyzer`. Recompute failures now logged at WARNING with frame number + reason, counters surfaced in the run summary. Measured 33-74% speed-up (VF-36). Uncovered VF-37 (align_zones already broken on moving footage) and OQ-17. |
+| 4 — Per-frame try/except in `run_surveillance` + `finally` release | **done** | Per-frame try/except (incl. `cap.read()`), consecutive-failure abort at 30, total-failure count reported, `cap.release()` + `processing_complete` in `finally`. `KeyboardInterrupt`/`SystemExit` re-raised. Verified against the real function with streamlit stubbed (VF-30). Carry-overs: OQ-14 (storage fatal branch), OQ-15 (`processing_complete` ambiguity). |
 | 5 — Confirmed vs predicted track states | **probably dropped** | Premise likely false (VF-4). User will drop it if the end-to-end assertion holds (OQ-3). `get_track_state_for_display` is unusable regardless (VF-3). |
 | 6a — IdentityGuardian embedding edge-normalisation fix | **on hold** | Do not implement while the Guardian may be disabled outright. Bug confirmed and is total, not partial (VF-5). |
 | 6b — `IDENTITY_GUARDIAN_ENABLED` flag | folded into Guardian A/B | Default changed from True to **False**. |
@@ -80,12 +80,37 @@ All changes are in `config.py`, `vision/tracker.py`, `vision/detector.py` and `s
    `TRACKER_NEW_TRACK_THRESH`, `TRACKER_MATCH_IOU_THRESHOLD`, each with a comment recording what
    measurement showed it actually does.
 
-### What did NOT ship (carried into Phase 2)
+### What did NOT ship
 
-Tasks **2** (MiDaS singleton), **3** (gate `align_zones`) and **4** (per-frame error handling in
-`run_surveillance`) were **never reached** — the queue was consumed by tracker correctness work.
-They remain open and unstarted. Task 4 in particular is a real robustness hole: the main loop still
-has no `try`/`except` and no `finally`, so one bad frame aborts a run and leaks the capture handle.
+Nothing from the original six-task scope remains unimplemented. Tasks 2, 3 and 4 were reached in a
+later pass and are complete. Two items were deliberately **dropped** (below), and Task 6c
+(a comment block marking the Guardian as a secondary ReID layer) is cosmetic and unstarted.
+
+6. **Per-frame error handling** (Task 4). The main loop had no `try`/`except` and no `finally`, so
+   one bad frame aborted a run, leaked the capture handle and left `processing_complete` unset.
+   Now every frame is guarded; failures are logged with frame number and traceback and skipped;
+   30 consecutive failures abort the run as systemic; the total skipped count is reported so a run
+   that quietly lost 200 frames does not look clean; and `cap.release()` plus `processing_complete`
+   sit in a `finally`. `KeyboardInterrupt`/`SystemExit` are re-raised, never swallowed.
+7. **MiDaS loaded once per process** (Task 2). It was reloaded on every run via
+   `PoseAnalyzer.__init__`. A lazy, thread-safe singleton keyed by (model type, device) cut a
+   second consecutive run from **3.34 s to 0.015 s**, while per-run state stays per-instance.
+8. **Zone alignment gated, then disabled by default** (Task 3). `align_zones` was the single most
+   expensive stage in the pipeline: 33-45% of the frame budget, more per frame than YOLO inference.
+   Gating behind `ZONE_ALIGN_INTERVAL` was implemented, but measurement then showed the feature
+   should not run at all on the deployment target -- on fixed cameras it corrects 0.10 px of
+   movement, and on moving footage it is actively harmful. `ZONE_ALIGN_ENABLED` now defaults to
+   **False**. End-to-end throughput rose from **7.2 fps to ~10.6 fps**.
+
+### What was measured and rejected
+
+- **`CONFIDENCE_THRESHOLD` -> 0.6** to close the confidence dead band: fragmented the regression
+  clip and discarded 56% of detections on a crowd clip (VF-19). Lowered `new_track_thresh` instead.
+- **`FRAME_SKIP` -> 3**: reached live-camera real time on one clip of three, but dropped the
+  tracker from 15 Hz to 10 Hz, moved the VF-13 split and shortened track life everywhere
+  (VF-38/39). Wrong trade for an attribution system.
+- **`ZONE_ALIGN_NFEATURES` -> 300**: 56% cheaper and accurate to 0.30 px, but the test footage has
+  no genuine camera motion, so the result is inconclusive rather than positive (VF-40).
 
 ### What was dropped, and why
 
@@ -100,15 +125,51 @@ has no `try`/`except` and no `finally`, so one bad frame aborts a run and leaks 
 
 ### Regression baseline at Phase 1 close
 
-`office cctv.mp4`, Guardian off, committed defaults → **6 tracks**, split at frames 430-448
-(track 4 ends 429, track 6 starts 450), median life 147, 29 ephemeral (2.8%).
-`crowd sample.mp4` → 787 dets / 117 ephemeral / 27 tracks / median 23.
-`crowded sample2.mp4` → 2502 dets / 124 ephemeral / 43 tracks / median 40.
+Verified at the final shipping defaults (Guardian off, alignment off, FRAME_SKIP=2):
+`office cctv.mp4` -> **6 tracks**, split at frames 430-448 (track 4 ends 429, track 6 starts 450),
+median life 147, 29 ephemeral (2.8%), 1050 detections.
+`crowd sample.mp4` -> 787 dets / 117 ephemeral / 27 tracks / median 23.
+`crowded sample2.mp4` -> 2502 dets / 124 ephemeral / 43 tracks / median 40.
+Throughput at those defaults: 10.64 / 11.28 / 9.55 processed fps (VF-41).
+Run `scratchpad/regression.py` after any change; it exits non-zero on drift.
 
 ### Open questions carried into Phase 2
 
-| ID | Question | Priority |
-|---|---|---|
+Ranked by priority.
+
+| Rank | ID | Question | Why it ranks here |
+|---|---|---|---|
+| 1 | **OQ-9** | **Split-intrusion attribution defect** -- a confirmed intrusion split across two `Person_<id>` rows. | **Corrupted record, not a missed detection.** The CSV is the seam to the analyst, which will narrate one event as two people, confidently and wrongly. Mitigation is cheap and needs no gallery. |
+| 2 | **OQ-17** | `align_zones` accepts a successful-but-absurd homography. | Real correctness bug; **dormant only because alignment is now off by default**. Must be fixed before alignment is ever re-enabled. |
+| 3 | **OQ-14** | Storage layer needs a distinguishable fatal error. | A locked file or dropped connection currently masquerades as 30 bad frames. Belongs in the DB migration. |
+| 4 | **OQ-16** | Run ORB on the downscaled frame. | Highest-value untested optimisation, but demoted by the alignment default change -- only matters if alignment returns. |
+| 5 | OQ-6 | Long-gap ReID gallery (OSNet-based). | Deferred to Phase 6; K=0 on target footage, but the face half of the risk is unmeasured (VF-28). |
+| 6 | OQ-12 | Why OSNet failed to re-associate at 21 updates when it recovered at 30. | Cheaper and more tractable lead than the gallery. |
+| 7 | OQ-13 | Enrol someone who appears in `office cctv.mp4`. | The one cheap step that makes M meaningful for the first time. |
+| 8 | OQ-15 | `processing_complete` cannot distinguish "finished" from "stopped". | UI honesty; an aborted or interrupted run looks complete. |
+| 9 | OQ-3 | Assert no predicted box reaches `check_trespassing`, then formally drop Task 5. | Closes a dangling task. |
+| 10 | OQ-1, OQ-4, OQ-7, OQ-8 | Unexplained `reid_snapshots` deletion; Guardian merge correctness; gaps 120/300 unmeasured; full-res crowd sheet inspection. | Low. |
+
+### Phase 1 in one paragraph
+
+Phase 1 was scoped as a six-task hardening pass and delivered all six, but the most valuable
+changes were not on the original list. Measurement repeatedly invalidated the premises behind the
+planned work: the tracker knob everyone assumed governed track lifetime (`max_age`) turned out to
+be inert, the appearance-based `IdentityGuardian` turned out to be merging visibly different people
+rather than fixing ID switches, and the zone-alignment feature turned out to cost a third of the
+frame budget while either doing nothing or throwing zones off-screen. What actually shipped was: a
+fix for ephemeral track IDs that were colliding by construction and merging unrelated people's
+identities, intrusion counters and trajectories; a fix for a tracker clock that froze whenever the
+scene was empty, which needed changes in two files because the obvious one was unreachable;
+closure of a confidence dead band that had made 31% of detections invisible to the event pipeline;
+the `IdentityGuardian` disabled behind a flag after contact sheets showed it collapsing five
+visibly distinct people into one identity; per-frame error handling so a single bad frame can no
+longer abort a run or leak the capture handle; and two performance fixes that raised end-to-end
+throughput from 7.2 to about 10.6 fps. Every claim in this file is backed by a measurement rather
+than by reading code, several widely-believed numbers were corrected along the way, and the system
+still does not keep up with a live 30 fps camera -- which is the binding constraint on Phase 2.
+
+---|---|---|
 | **OQ-9** | **Split-intrusion attribution defect** — a confirmed intrusion split across two `Person_<id>` rows corrupts the CSV the analyst reads. Cheap mitigation, independent of any gallery. | **highest — corrupted record, not a missed detection** |
 | OQ-6 | Long-gap ReID gallery (OSNet-based). Deferred to Phase 6; K=0 on target footage. | Phase 6 |
 | OQ-12 | Why OSNet failed to re-associate at 21 updates when it recovered at 30. Likely `proximity_thresh` + Kalman drift. Cheaper lead than the gallery. | medium |
@@ -116,6 +177,24 @@ has no `try`/`except` and no `finally`, so one bad frame aborts a run and leaks 
 | OQ-3 | Assert no predicted box reaches `check_trespassing`, then formally drop Task 5. | low |
 | OQ-1 | What deleted `data/reid_snapshots/`. | low, unexplained |
 | OQ-4, OQ-7, OQ-8 | Guardian merge correctness; gaps 120/300 unmeasured; full-res crowd sheet inspection. | low |
+
+---
+
+## 2c. PHASE 2 PLANNING CONSTRAINTS
+
+**The pipeline does not currently keep up with a live camera. This is the binding constraint on
+Phase 2, and it must not be buried in a benchmark table.**
+
+Measured (VF-31): a full run of `office cctv.mp4` through the real `run_surveillance()` processes
+**7.2 frames per second** end to end. At `FRAME_SKIP=2`, a 30fps camera produces 15 frames per
+second that need processing, so the system runs at **roughly half real time**. Against a live
+source it would fall behind continuously — the backlog grows for as long as the camera is on.
+
+The ~15 fps figure quoted previously is **detection and tracking only**. Roughly half the frame
+budget goes to everything else (zones, depth, faces, drawing). Any Phase 2 live-camera plan needs
+one of: a per-stage optimisation pass (start from the profile), a higher `FRAME_SKIP`, GPU
+inference (currently `torch-2.11.0+cpu`), or an explicit frame-dropping policy that keeps latency
+bounded instead of queueing.
 
 ---
 
@@ -335,6 +414,152 @@ Established by measurement. Evidence in one line each.
   near-zero measured impact here must NOT be read as the fix being unnecessary — this is a
   Phase 2 correctness fix that happens to be cheap now.**
 
+- **VF-30 — Task 4 per-frame error handling verified against the real `run_surveillance()`.**
+  Measured by calling the shipped function with `streamlit` stubbed out (not a copy of the loop),
+  on `Demo_MIdas.mp4`:
+  | Scenario | Raised | `processing_complete` | UI result |
+  |---|---|---|---|
+  | clean run | None | True | 1 success |
+  | 8 transient frame failures | None | True | warning "8 frame(s) were skipped", then success |
+  | permanent failure | None | True | error "Aborted after 30 consecutive frame failures at frame 60" |
+  | KeyboardInterrupt | **KeyboardInterrupt** | True | propagated; `finally` still ran |
+  Abort fires at exactly `MAX_CONSECUTIVE_FAILURES=30`; the `finally` executes on every path.
+  Detection/tracking numbers **byte-identical** on all three clips afterwards, and VF-13 passes
+  (6 tracks, split at 430-448) — Task 4 touches only `streamlit_app.py`.
+
+- **VF-31 — ⚠️ END-TO-END THROUGHPUT IS 7.2 fps, NOT 15. The system does not keep up with a live
+  camera.** Measured: a full `office cctv.mp4` run through the real `run_surveillance()` took
+  **739 processed frames in 102.8 s = 7.2 fps**. The often-quoted **~15 fps is detection-and-
+  tracking ALONE** (the baseline harness, which calls `PoseDetector` directly and skips zones,
+  depth, faces and drawing). **Roughly half the frame budget is spent outside YOLO and the
+  tracker.** At `FRAME_SKIP=2` a 30fps source needs 15 processed fps to stay real-time, so at
+  7.2 fps the pipeline runs at **about half real time**. See section 2c.
+
+- **VF-32 — MiDaS singleton: 3.34 s → 0.015 s on a second run in the same process (223x).**
+  Measured before/after in one process: old behaviour (a `torch.hub.load` pair per
+  `PoseAnalyzer`) cost 4.78 s then 3.34 s; with the singleton, construction costs 3.38 s once
+  then 0.015 s. Verified the model and transform objects are shared (`is` identical) while
+  per-run state (ORB reference, Kalman dicts) stays distinct per instance.
+
+- **VF-33 — `person_depth_filters` growth is negligible on file playback.** Measured over a full
+  `office cctv.mp4` run with one restricted zone: **13 entries**, from 10 distinct person ids
+  (5 of them ephemeral/negative), 1-2 keys each. Bound is
+  *(ids that reach a zone) × (zone types) × (≤2 keypoint indices)*, each entry a `KalmanSmoother`
+  of four floats. Unbounded only under a long-lived live camera; not worth fixing for Phase 1.
+
+- **VF-34 — PER-STAGE PROFILE. `align_zones` is the single largest stage, costing more per frame
+  than YOLO inference.** Measured with manual timers around each stage in a full real
+  `run_surveillance()` run (cProfile attributes into torch/cv2 internals and cannot answer
+  "which stage costs what"). st.image() was stubbed, so browser-render cost is excluded.
+  | Stage | office cctv (1080p) | crowded sample2 (640x480) |
+  |---|---|---|
+  | **align_zones (ORB+RANSAC)** | **35.18 s — 33.5% — 47.61 ms/call** | **16.07 s — 28.8% — 47.83 ms/call** |
+  | YOLO inference | 24.68 s — 23.5% — 33.40 ms | 12.54 s — 22.4% — 37.31 ms |
+  | tracker (incl. OSNet) | 18.16 s — 17.3% | 15.12 s — 27.0% |
+  | — of which OSNet embedding | 16.91 s — 16.1% | 13.50 s — 24.1% |
+  | face identify_person (DeepFace) | 6.61 s — 6.3% | 1.72 s (1 call = lazy model load) |
+  | MiDaS depth | 4.80 s — 4.6% | 2.62 s — 4.7% |
+  | zone geometry / theft / drawing / logging | <3.5% combined | <4% combined |
+  | unattributed (read, resize, box rescale, loop) | 12.18 s — 11.6% | 5.04 s — 9.0% |
+  **Key sub-finding: the align_zones cost is RESOLUTION-INDEPENDENT** — 47.61 ms at 1920x1080 and
+  47.83 ms at 640x480. The time is in `BFMatcher(NORM_HAMMING, crossCheck=True)`, which is O(n²)
+  in `nfeatures`, not in feature detection. See VF-35 and OQ-16.
+
+- **VF-35 — `ZONE_ALIGN_NFEATURES` is a real lever, but there is a fixed floor; "an order of
+  magnitude cheaper" was WRONG.** Measured on office cctv (1080p, 73 sampled frames):
+  | nfeatures | ms/call | vs 1000 | homography failures | corner error vs n=1000 (mean / p95 / max) |
+  |---|---|---|---|---|
+  | 1000 | 54.50 | — | 0/73 | — |
+  | 600 | 33.32 | −39% | 0/73 | 0.23 / 0.56 / 3.52 px |
+  | 300 | 24.02 | −56% | 0/73 | 0.30 / 0.74 / 3.36 px |
+  Fitting `cost = a + b·n²` gives **a ≈ 20.9 ms fixed** (ORB detection + grayscale on 1080p) plus
+  ~34 ms of quadratic matching at n=1000; the model predicts 55.3 ms vs 54.5 measured. So the
+  matcher is quadratic as claimed, but the fixed floor means 1000→300 cuts features 3.3× and time
+  only 2.3×. Accuracy holds well under a pixel at both lower settings.
+  ⚠️ Measured on 1080p only; the fixed floor scales with frame area, so proportions differ at
+  lower resolution. **RULED: stays at 1000.** The evidence was INCONCLUSIVE, not negative — see
+  VF-40. Largely moot now that `ZONE_ALIGN_ENABLED` is False; kept logged in case alignment is
+  re-enabled.
+
+- **VF-36 — Gating `align_zones` delivers a 33-74% end-to-end speed-up.** Measured end-to-end
+  through the real `run_surveillance()` (st.image stubbed, so excluded equally from all rows):
+  | Clip | interval 1 | **interval 15** | disabled |
+  |---|---|---|---|
+  | office cctv | 6.99 fps (align 33.7%) | **11.37 fps (align 3.8%)** | 11.86 fps |
+  | crowd sample | 5.67 fps (align 44.7%) | **9.89 fps (align 5.3%)** | 10.92 fps |
+  | crowded sample2 | 6.93 fps (align 32.1%) | **9.19 fps (align 3.2%)** | 9.13 fps |
+  Interval 15 captures most of what disabling gives (office cctv 11.37 vs 11.86). On crowded
+  sample2, interval 15 and disabled are identical within noise. Projection from VF-34 was
+  10.2 fps for office cctv; actual 11.37, i.e. the projection was conservative.
+
+- **VF-37 — ⚠️ `align_zones` IS ALREADY BROKEN on moving/crowded footage, and it fails SILENTLY.**
+  Measured frame-to-frame zone-corner movement under the ORIGINAL every-frame behaviour
+  (interval 1), with a central 30% test zone:
+  | Clip | mean | p95 | max | frames with zone thrown off-screen | recompute failures |
+  |---|---|---|---|---|---|
+  | office cctv (fixed camera) | **0.10 px** | 1.00 px | 4.00 px | 0/739 | 0 |
+  | crowd sample | **198.96 px** | 845 px | 9629 px | **9/170** | 0 |
+  | crowded sample2 | **51.25 px** | 188 px | 5201 px | **3/336** | 0 |
+  On the crowd clips ORB matches frame 0 against a scene dominated by moving people, RANSAC finds
+  a "consensus" from moving points, and the zones are hurled thousands of pixels — sometimes
+  entirely out of frame. **Zero recompute failures**: the homography SUCCEEDS and is garbage.
+  This is pre-existing, not caused by gating. It also means the Task 3(d) WARNING does NOT catch
+  the failure mode that actually occurs — see OQ-17.
+  **Consequence: the interval-15 "zone drift" figures on the crowd clips (mean 298 px / 29 px)
+  are measured against a garbage reference and say nothing about gating.** The only trustworthy
+  drift figure is office cctv: **mean 0.16 px, p95 1.00 px, max 3.00 px** — gating is safe there.
+
+- **VF-38 — No configuration reaches live-camera real time at FRAME_SKIP=2; only the target clip
+  does at FRAME_SKIP=3.** Measured end-to-end, `source_fps = processed_fps x FRAME_SKIP`
+  (threshold for a 30fps camera is 30):
+  | Clip | FS=2 processed / source | FS=3 processed / source | real time at FS=3? |
+  |---|---|---|---|
+  | office cctv | 9.79 / **19.58** | 10.64 / **31.93** | **YES** |
+  | crowd sample | 10.30 / **20.61** | 9.29 / **27.86** | no |
+  | crowded sample2 | 9.24 / **18.49** | 8.41 / **25.23** | no |
+  Note processed_fps does not rise proportionally at FS=3 (and falls on two clips), because
+  `cap.read()` still runs on every source frame regardless of skipping.
+
+- **VF-39 — FRAME_SKIP=3 changes the regression materially; VF-13 would need restating.**
+  Measured (FS=2 baseline in brackets): office cctv dets 699 [1050], ephemeral 14 [29],
+  **tracks 6 [6]**, median life 100 [147], **split moves to track4 ending 286 / track6 starting
+  342** [429/450]. crowd sample 516 dets [787], 25 tracks [27], median 15 [23].
+  crowded sample2 1672 dets [2502], 37 tracks [43], median 31 [40].
+  Track count on the regression clip happens to stay 6, but every other number moves and the
+  split frames change, so **the VF-13 rule as written would fail at FS=3**.
+  **RULED: FRAME_SKIP stays 2. FS=3 measured and REJECTED — do not re-propose without new
+  evidence.** It reaches real time on one clip of three, and buys that by dropping the tracker
+  from 15 Hz to 10 Hz. For a system whose purpose is attributing events to specific people, that
+  is the wrong trade. Rationale is also recorded in the code comment at `FRAME_SKIP`.
+  **Separate finding: `cap.read()` runs on EVERY source frame regardless of skipping**, so
+  FRAME_SKIP saves inference time but not decode time. Decode is a Phase 2 reader-thread problem,
+  not a FRAME_SKIP tuning problem.
+
+- **VF-40 — The nfeatures=300 outliers correlate WEAKLY with camera motion, and office cctv has
+  too little motion to settle it.** Re-measured densely (369 frames, every 2nd processed, vs 73
+  before): corner error mean 0.50 px, p95 1.04 px, **max 4.65 px** — denser sampling found worse
+  outliers than the first pass. Of 19 outliers at/above p95, outlier median |translation| is
+  **4.19 px vs 2.76 px** for non-outliers, rotation 0.029 deg vs 0.015 deg.
+  Pearson r(corner_err, translation) = **+0.338**, rotation +0.241, scale +0.267.
+  So the correlation is real but weak (motion explains ~11% of variance), **and the entire motion
+  range in this clip is 2-6 px of translation and <0.1 deg of rotation** — a fixed camera with
+  jitter. **This does NOT answer whether nfeatures=300 degrades under genuine camera motion**,
+  because no such motion exists in the test footage.
+  **RULED: nfeatures stays 1000.** Recorded as inconclusive, not negative: a future test needs
+  footage from a camera that genuinely moves, and per VF-37 that footage first needs OQ-17's
+  sanity check or alignment is garbage there regardless of feature count.
+
+- **VF-41 — SHIPPING CONFIGURATION THROUGHPUT (alignment disabled, FRAME_SKIP=2).** These are the
+  numbers that reflect what actually ships; VF-36's interval-15 row does not.
+  | Clip | processed fps | source fps | vs old every-frame alignment |
+  |---|---|---|---|
+  | office cctv | **10.64** | 21.29 | 1.52x |
+  | crowd sample | **11.28** | 22.56 | 1.99x |
+  | crowded sample2 | **9.55** | 19.09 | 1.38x |
+  End-to-end throughput therefore rose from **7.2 fps (VF-31) to ~10.6 fps** on the target clip.
+  Still below the 30 source-fps live-camera threshold (see section 2c) — this is a speed-up, not
+  a solution to real time.
+
 - **VF-10 — Snapshot banks saturate almost immediately.** Measured embedding updates per identity
   vs `MAX_SNAPSHOTS=8`: 302 on office cctv, up to 122 on crowded sample2. The overwritten file is
   **`snap_008.jpg`** (bank length is post-append, capped at 8), not `snap_007.jpg`.
@@ -367,6 +592,61 @@ Established by measurement. Evidence in one line each.
   failure. That rules out raising `TRACKER_TRACK_BUFFER` — VF-1 already established removal is not
   the binding constraint. Six is the honest count of what BotSort resolves on that clip with a
   correct clock; five was the count under a bug. VF-13 rewritten accordingly.
+
+- **OQ-17 — ⭐ HIGHEST PRIORITY BEFORE ALIGNMENT IS EVER RE-ENABLED. `align_zones` needs a sanity
+  check on the computed homography, not just on failure.** PROMOTED: this is a real correctness
+  bug, not an optimisation — the homography succeeds, reports no error, and is nonsense, so zones
+  silently sit in the wrong place and intrusion decisions are made against them. **Dormant, not
+  fixed:** `ZONE_ALIGN_ENABLED` is now False by default, which is the only reason it does not
+  block Phase 1. ⚠️ **The Task 3(d) WARNING catches the WRONG failure mode** — zero recompute
+  failures occurred on any clip; the failure is a successful-but-absurd homography.
+  VF-37 shows the real failure mode is a homography that succeeds and is garbage (zones thrown
+  off-screen with zero recompute failures). The Task 3(d) WARNING only fires when computation
+  FAILS, so it catches the case that does not happen and misses the one that does. A cheap guard:
+  reject a new M if it moves the zone corners more than some fraction of the frame, or if its
+  scale/shear is implausible, and keep the previous homography instead — with a WARNING. Needs a
+  threshold chosen against measurement, not guessed. **Not implemented; Task 3 was closed on
+  its specified scope.**
+
+- **OQ-16 — ⭐ HIGHEST-VALUE UNTESTED OPTIMISATION: run ORB on the downscaled frame.**
+  `run_surveillance` already builds a 640-wide copy for YOLO (`infer_frame`), but calls
+  `analyzer.align_zones(frame, zones)` with the **full-resolution** frame. VF-35 showed the
+  align_zones cost splits into ~21 ms of fixed ORB detection + grayscale (which scales with frame
+  **area**) plus ~34 ms of O(n²) matching. On office cctv the area ratio is
+  1920×1080 → 640×360, i.e. **9× fewer pixels**, so the fixed component should fall to roughly
+  2-3 ms. A homography is only a linear map, so the result scales back to full resolution with a
+  straightforward coordinate transform (conjugate M by the scale matrix).
+  **This is orthogonal to both existing levers** — it attacks the fixed floor that
+  `ZONE_ALIGN_NFEATURES` cannot touch, and it compounds with `ZONE_ALIGN_INTERVAL` gating.
+  Potentially better than either.
+  ⚠️ **RISK, and why a timing number alone is not enough:** downscaling reduces the number of
+  distinguishable ORB keypoints, so match quality may degrade in a way the nfeatures sweep does
+  **not** predict — fewer pixels is not the same as fewer requested features. Any test must repeat
+  the **corner-reprojection accuracy check** from VF-35 (reproject zone corners through the
+  downscaled-and-rescaled homography, compare in pixels against the full-resolution result), not
+  just report ms/call. Deliberately **not implemented** in Task 3, which was closed on its
+  specified scope.
+
+- **OQ-14 — The storage layer needs its own fatal-error branch; it does NOT go away with the CSV.**
+  Task 4 treats every per-frame exception as skippable. A storage failure is not: if writing an
+  event fails, it fails on **every** frame that logs an event, so the run burns 30 frames and then
+  aborts with a message that looks like a detection failure. Today that is
+  `PermissionError`/`OSError` on `storage/event_logs.csv` (e.g. the file open in Excel).
+  **A database does not fix this** — a locked SQLite file, an exhausted connection pool or a
+  dropped connection produces exactly the same pattern. **When the CSV is replaced by a database,
+  the storage layer must raise a distinguishable fatal error that `run_surveillance` aborts on
+  immediately, rather than letting it masquerade as 30 bad frames.** Deliberately not implemented
+  as a CSV-specific branch, which would be dead code after the migration.
+
+- **OQ-15 — `processing_complete` cannot distinguish "finished" from "stopped".** The Task 4
+  `finally` sets `processing_complete = True` on **every** exit path. Two consequences, both
+  currently invisible in the UI:
+  1. **Ctrl+C / KeyboardInterrupt** — an interrupted run presents the Analyst tab as ready.
+  2. **The 30-consecutive-failure abort** — an aborted run also looks complete. (An `st.error`
+     is shown, but the state flag says otherwise, and the flag is what the UI gates on.)
+  Fix: a separate `run_completed` flag distinct from `processing_complete`, so the UI can tell
+  "the loop stopped" from "the video finished". Not implemented — the flag semantics are a UI
+  decision, and `processing_complete` is also read by the Analyst tab's existing-logs path.
 
 - **OQ-13 — Enrol someone who actually appears in `office cctv.mp4`, then re-run the re-entry
   study.** This is the single concrete step that would make **M meaningful for the first time**
@@ -458,6 +738,14 @@ Established by measurement. Evidence in one line each.
   `IdentityGuardian._embeddings` / `_frame_count` / `_missing`, `st.session_state.track_positions`,
   and `data/reid_snapshots/` on disk.
 
+**Corrections to the record** (claims that were asserted and turned out to be untrue)
+- **"A comment noting `person_depth_filters` unbounded growth was added in Task 1c."** Never true.
+  Task 1c did not touch `vision/pose_analyzer.py` at all; the note existed only in this file's
+  Gotchas. A real code comment was added in **Task 2**. Logged because the claim was stated as
+  established fact and would have been trusted.
+- **"Pipeline throughput is ~15 fps."** True only for detection-and-tracking in isolation.
+  End-to-end is **7.2 fps** (VF-31).
+
 **README.md inaccuracies** (fix when next touching it)
 - Says the repeatedly-overwritten snapshot is `snap_007.jpg`; it is **`snap_008.jpg`** (VF-10).
 - Records `boxmot==18.0.0` from package metadata, but the runtime banner prints `BoxMOT v17.0.0`.
@@ -485,6 +773,7 @@ Established by measurement. Evidence in one line each.
 | `scratchpad/osnet_gap_test.py "<clip>.mp4"` | At what gap length BotSort+OSNet stops recovering a track ID. |
 | `scratchpad/contact_sheet.py on\|off "<clip>.mp4"` | Visual audit of ReID merging; one PNG row per identity. Use `off` for the regression check in VF-13. |
 | `scratchpad/guardian_ab.py` | Identity counts + track-lifetime distributions, Guardian ON vs OFF. |
+| `scratchpad/regression.py` | **Run after every change.** The standing Phase 1 regression: VF-13 (office cctv = 6 tracks, split at 430-448) plus ephemeral counts and median track life on all three clips. Exits non-zero on any drift. |
 | `scratchpad/deadband_ab.py` | Detections / ephemeral % / lifetimes across the three dead-band modes, with the VF-13 regression check built in. |
 | `scratchpad/newtracks_045.py` | Isolates tracks that exist at one `new_track_thresh` but not another and scores them duplicate-vs-genuine. |
 | `scratchpad/baseline_reid.py [out.jsonl]` | Guardian stats baseline across the three clips. |
