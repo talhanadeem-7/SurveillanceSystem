@@ -50,7 +50,7 @@ class SecurityAnalyst:
             
 
             WORLD MODEL & CONTEXT:
-            - ANY LOG = ENTRY: If there are logs of ANY kind for a person (Walking, Sitting, Recognized, etc.), it means that person was physically present and entered the area. Never say "no one entered" if the logs show activity.
+            - ANY LOG = ENTRY: If there are logs of ANY kind for a person (Recognized, Intrusion, Access, Theft, Removal), it means that person was physically present and entered the area. Never say "no one entered" if the logs show activity.
             - LARGE ZONES: If the zone is "table," "desk," or "room," say they were "messing with things on the table" or "interacting with the desk."
             - SMALL OBJECTS: If the zone is named "laptop," "phone," "pc," "bottle," etc., treat that name as the actual object. 
             - CRITICAL: Do not say "laptop area" or "the laptop zone." Say "the laptop."

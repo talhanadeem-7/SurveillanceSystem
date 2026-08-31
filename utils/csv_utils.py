@@ -103,16 +103,19 @@ class LogAnalyzer:
         # It reads everything that ever happened and turns it into a detailed story.
         """
         Reads ALL logs and returns a list of natural language sentences.
-        Uses state-tracking to describe transitions (e.g., Sitting -> Walking = 'got up').
+
+        Note: this narrates discrete security events only (Identity / Intrusion /
+        Access / Theft / Removal). Pose-derived behaviour verbs ("Walking",
+        "Sitting", "Bending", ...) were produced by vision/action_recognizer.py,
+        which was deleted; activity understanding now comes from
+        vision/vlm_activity_analyzer.py, which writes to
+        storage/activity_observations.csv rather than to this log.
         """
         df = self.load_data()
         if df.empty:
             return []
 
         documents = []
-        # tracker to remember the last verb seen for each person
-        # Format: { "Talha": "Sitting", "Person_1": "Walking" }
-        last_action_per_entity = {}
 
         for index, row in df.iterrows():
             timestamp = row['Timestamp']
@@ -121,49 +124,11 @@ class LogAnalyzer:
             verb = row['Status']
             loc = row['Location']
 
-            # 1. PREPOSITION LOGIC (From previous step)
-            prep = "at the"
-            if loc == "General Area": prep = "in the"
-            elif verb in ["Sitting", "Lying Down"] and loc.lower() in ["sofa", "chair", "bed", "couch"]:
-                prep = "on the"
-            elif verb in ["Walking", "Standing", "Running", "Bending", "Picking Up"]:
-                prep = "near the"
+            # PREPOSITION LOGIC
+            prep = "in the" if loc == "General Area" else "at the"
 
-            # 2. TRANSITION LOGIC (State Awareness)
-            last_verb = last_action_per_entity.get(entity, None)
-            desc = f"was seen {verb.lower()}" # Default
-
-            if action_type == "Behavior":
-                if verb == "Walking":
-                    if last_verb in ["Sitting", "Lying Down"]:
-                        desc = "got up and moved"
-                    elif last_verb == "Bending":
-                        desc = "straightened up and moved"
-                    else:
-                        desc = "approached" if loc != "General Area" else "was seen walking"
-
-                elif verb == "Sitting":
-                    desc = "sat down" if last_verb == "Walking" else "was seen sitting"
-
-                elif verb == "Lying Down":
-                    desc = "lay down" if last_verb == "Walking" else "was seen lying down"
-
-                elif verb == "Bending":
-                    desc = "stooped down"
-
-                elif verb == "Picking Up":
-                    desc = "picked something up"
-
-                elif verb == "Running":
-                    desc = "started running"
-
-                # Update the tracker for the next row
-                last_action_per_entity[entity] = verb
-
-            # 3. CONSTRUCT SENTENCE
-            if action_type == "Behavior":
-                text = f"At {timestamp}, {entity} {desc} {prep} {loc}."
-            elif action_type == "Identity":
+            # CONSTRUCT SENTENCE
+            if action_type == "Identity":
                 text = f"At {timestamp}, {entity} was {verb}."
             elif action_type == "Intrusion":
                 text = f"At {timestamp}, {entity} was detected intruding {prep} {loc}."

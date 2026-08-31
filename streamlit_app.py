@@ -13,6 +13,7 @@ import config
 from vision.detector import PoseDetector
 from vision.pose_analyzer import PoseAnalyzer
 from vision.face_recognition import FaceIdentifier
+from vision.vlm_activity_analyzer import VLMActivityAnalyzer
 
 from storage.event_logger import EventLogger
 from utils.video_utils import draw_surveillance_ui  # use the drawing logic
@@ -31,7 +32,7 @@ from utils.heatmap import (
 
 def configure_logging():
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
         force=True,
     )
@@ -202,9 +203,7 @@ def run_surveillance():
         face_candidate_state,
         intrusion_persistence,
         person_location_state,
-        behavior_logged_ids,
-        logged_general_ids,
-        track_ids_logged_general,
+        activity_cache,
         PERSISTENCE_THRESHOLD,
     ) = setup_surveillance_memory()
     identity_revalidation_state = {}
@@ -367,6 +366,32 @@ def run_surveillance():
                                 frame_id,
                             )
 
+                        # --- VLM ACTIVITY COLLECTION ---
+                        # Collect frames for VLM activity analysis (only for persistent tracks).
+                        # Activity analysis is triggered at an interval and does not block the main loop.
+                        if not is_ephemeral and st.session_state.activity_analyzer.enabled:
+                            # Pass bbox so the analyzer buffers a CROP of this
+                            # person, not the whole scene. The prompt names a
+                            # track id, and a full frame gives the model no way
+                            # to tell which person that id is.
+                            st.session_state.activity_analyzer.add_frame(
+                                current_id, frame, frame_id, bbox
+                            )
+                            # Trigger analysis if interval is reached
+                            st.session_state.activity_analyzer.analyze_if_ready(
+                                current_id, frame_id
+                            )
+                            # Always read through get_activity so the TTL applies:
+                            # analyze_if_ready returns the cached result while a
+                            # call is in flight, which would bypass expiry.
+                            completed_activity = st.session_state.activity_analyzer.get_activity(
+                                current_id, frame_id
+                            )
+                            if completed_activity:
+                                activity_cache[current_id] = completed_activity
+                            else:
+                                activity_cache.pop(current_id, None)
+
                         # --- A. DETERMINE CURRENT LOCATION (Passive Context) ---
                         #  It checks where the person is standing.
                         current_loc = "General Area" 
@@ -494,9 +519,6 @@ def run_surveillance():
                                                 f"Recognized as {found_name}",
                                                 current_loc,
                                             )
-
-                                            behavior_logged_ids.add(found_name)
-                                            logged_general_ids.add(found_name)
                                     else:
                                         candidate["name"] = None
                                         candidate["count"] = 0
@@ -628,7 +650,9 @@ def run_surveillance():
                                 )
 
                 # --- H. RENDERING AND UI UPDATES ---
-                draw_surveillance_ui(frame, results, zones, identity_map)
+                draw_surveillance_ui(
+                    frame, results, zones, identity_map, activity_cache
+                )
 
                 # --- PERFORMANCE: throttle display — only push frame to browser
                 # at the target rate.  Heavy inference can run every loop tick,
@@ -643,11 +667,24 @@ def run_surveillance():
                     )
                     # Show IdentityGuardian live stats in the status panel
                     guardian_stats = st.session_state.detector.guardian.get_stats()
+                    
+                    # Build activity status display
+                    activity_status = "No activities tracked"
+                    if activity_cache:
+                        activities = []
+                        for track_id, result in list(activity_cache.items())[-3:]:  # Show last 3
+                            activities.append(
+                                f"Track {track_id}: **{result.activity}** "
+                                f"(conf: {result.confidence:.2f})"
+                            )
+                        activity_status = "\n\n".join(activities)
+                    
                     status_text.markdown(
                         f"**Frame:** {frame_id}\n\n"
                         f"**Known Identities:** {guardian_stats['known_identities']}\n\n"
                         f"**ID Corrections:** {guardian_stats['active_remaps']}\n\n"
-                        f"**Retired IDs:** {guardian_stats['retired_ids']}"
+                        f"**Retired IDs:** {guardian_stats['retired_ids']}\n\n"
+                        f"**Recent Activities:**\n\n{activity_status}"
                     )
                     last_display_time = now
 
@@ -916,6 +953,9 @@ def initialize_surveillance_components():
         with st.spinner("Initializing Face Recognition System..."):
             st.session_state.face_recognizer = FaceIdentifier()
 
+    if 'activity_analyzer' not in st.session_state:
+        st.session_state.activity_analyzer = VLMActivityAnalyzer()
+
 def setup_surveillance_memory():
 
     if 'analyst' not in st.session_state:
@@ -927,20 +967,20 @@ def setup_surveillance_memory():
     ref_frame_bgr = cv2.cvtColor(st.session_state.first_frame, cv2.COLOR_RGB2BGR)
     analyzer = PoseAnalyzer(ref_frame_bgr)
 
+    # Reset VLM activity analyzer for this run
+    st.session_state.activity_analyzer.reset()
+
     # --- MEMORY STORES (Exactly as per your app.py) ---
     identity_map = {}
     unknown_check_counters = {}
     face_candidate_state = {}
     intrusion_persistence = {}
     person_location_state = {}  # Tracks where each person was last seen
-    behavior_logged_ids = set()  
-    logged_general_ids = set()  
-    track_ids_logged_general = set() # Tracks physical body IDs
+    activity_cache = {}  # {track_id: ActivityResult} -- populated by VLMActivityAnalyzer
     PERSISTENCE_THRESHOLD = 5
-    
-    return (analyzer, identity_map, unknown_check_counters, face_candidate_state, intrusion_persistence, 
-            person_location_state, behavior_logged_ids, logged_general_ids, 
-            track_ids_logged_general, PERSISTENCE_THRESHOLD)
+
+    return (analyzer, identity_map, unknown_check_counters, face_candidate_state, intrusion_persistence,
+            person_location_state, activity_cache, PERSISTENCE_THRESHOLD)
 
 
 

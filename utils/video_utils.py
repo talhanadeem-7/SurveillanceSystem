@@ -131,7 +131,7 @@ class ZoneSelector:
             
         return final_zones
 
-def draw_surveillance_ui(frame, results, zones, identity_map=None):
+def draw_surveillance_ui(frame, results, zones, identity_map=None, activity_cache=None):
     # 1. Draw Zones (Logic unchanged)
     for z in zones:
         if z['type'] == 'restricted':
@@ -165,6 +165,20 @@ def draw_surveillance_ui(frame, results, zones, identity_map=None):
             
             # Draw Name/ID Label
             cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+            # Draw the latest VLM activity beside the person's box.
+            if activity_cache and p_id in activity_cache:
+                activity = activity_cache[p_id]
+                activity_label = f"{activity.activity} ({activity.confidence:.2f})"
+                cv2.putText(
+                    frame,
+                    activity_label,
+                    (x2 + 5, max(20, y1 + 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    box_color,
+                    2,
+                )
 
             # --- DRAW SKELETON ---
             kpts = results.keypoints[i]

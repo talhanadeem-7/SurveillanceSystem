@@ -737,6 +737,66 @@ Established by measurement. Evidence in one line each.
 - Unbounded dicts, never pruned: `PoseAnalyzer.person_depth_filters` / `zone_depth_filters`,
   `IdentityGuardian._embeddings` / `_frame_count` / `_missing`, `st.session_state.track_positions`,
   and `data/reid_snapshots/` on disk.
+- **VF-42 — The VLM was never wrong; the LABEL WAS STALE.** Reported as "sitting shown as walking".
+  Measured on `sitting.mp4` (607 frames, **60 fps**, 10.1 s): the shipped gating ran only **3**
+  analyses for the entire clip, each covering **under 1 s of video**, with **4 s unanalysed between
+  them**. The trigger frames were dumped and inspected: at frame 30 and frame 270 the person really
+  **was** walking toward the chair; the frame-510 sitting analysis never landed before the run
+  ended. The two calls in the user's log (01:57:38, 01:57:49) are exactly those two walking
+  moments. Proof the model is accurate: fed the sitting frames directly, `gpt-4o-mini` returned
+  `sitting` at **confidence 1.0** — and returned `sitting` **with the colour bug still present**,
+  so the colour bug was not the cause.
+  Root causes, all fixed: (a) a **second freshness gate** in `analyze_if_ready`
+  (`current_frame_id - cached.frame_ids[-1] < interval*2`) that **doubled** the effective interval
+  on top of `should_analyze`, which already rate-limited on the same clock; (b) results **never
+  expired**, so a verdict displayed forever; (c) only one analysis per track in flight, so a ~10 s
+  API call blocked refresh for 10 s of wall time.
+  After the fix, same clip: **20 analyses, one every 0.5 s of video**. Labels through the shipped
+  path now track reality — t=1.5 s `walking` (0.9), t=4.5 s `interacting_with_object` ("reaching
+  for a chair", 0.8), t=9.5 s `sitting` (0.9).
+- **VF-43 — Two further VLM defects, both measured.**
+  1. **Colour channels were double-swapped in every image ever sent.** `cv2.cvtColor(BGR2RGB)`
+     followed by `cv2.imencode`, which itself expects BGR. Measured: a centre patch of BGR
+     `[171,190,201]` arrived as `[201,190,171]`. Skin rendered blue. Fixed by passing BGR straight
+     to `imencode`.
+  2. **Payload was ~3.26 MB per call** (full-frame lossless PNG at source resolution). ⚠️ Cropping
+     to the person **made it worse, not better** — 3.95 MB — because the clip is portrait and the
+     crop is barely smaller while PNG compresses a detailed person crop poorly. *An earlier claim
+     that cropping would cut payload ~30x was wrong and was corrected by measurement.* What
+     actually worked: downscale to `VLM_ACTIVITY_MAX_IMAGE_SIDE=512` + JPEG q85 →
+     **0.280 MB mean, 0.375 MB max (11.6x smaller)**. This matters for correctness, not just cost:
+     upload latency is what bounds label freshness.
+- **The frames sent are now a padded CROP of the tracked person**, not the whole scene. The prompt
+  names a track id, but a full frame carried nothing identifying which person that id was — with
+  two people in shot the answer was unattributable. `add_frame` now takes `bbox`.
+- **`VLM_ACTIVITY_MIN_TRACK_AGE` is now read** (it was dead config). `VLM_ACTIVITY_MIN_MOVEMENT`
+  is **still dead** — documented as intent, not a live knob.
+- ⚠️ **`VLM_ACTIVITY_ANALYSIS_INTERVAL` is in SOURCE frames, so its real-time meaning depends on
+  clip frame rate.** The config comment says "~2 seconds at FRAME_SKIP=2", which assumes 30 fps
+  source. On this 60 fps clip the same value is **0.5 s**. Not fixed; flagged.
+- **VLM activity results are never persisted.** `storage/activity_observer.py` (`ActivityObserver`)
+  exists and is documented in `VLM.md`, but **nothing imports it**. `VLMActivityAnalyzer` output
+  goes only into the in-memory `activity_cache`, which is drawn on the frame and shown in the
+  sidebar, then discarded at end of run. `storage/activity_observations.csv` is therefore never
+  written, and activity never reaches the RAG analyst. See the action-recognizer cleanup note below.
+
+**action_recognizer removal (2026-09-01)** — `vision/action_recognizer.py` itself was already
+deleted in commit `760a6c2`; the residue it left behind has now been removed:
+- `config.py`: `ACTION_MODEL_PATH`, `ACTION_WINDOW`, `RUNNING_VELOCITY_THRESHOLD`,
+  `BENDING_RATIO_THRESHOLD`, `PICKUP_HAND_KNEE_RELATION` (removed in the working tree before
+  this pass; README updated to match).
+- `utils/csv_utils.py`: the whole `"Behavior"` narration branch and its `last_action_per_entity`
+  state machine, which existed solely to narrate the recognizer's Walking/Sitting/Bending/
+  Picking Up/Running rows. **Verified dead by measurement, not by reading**: `storage/event_logs.csv`
+  contains 0 `Behavior` rows (Action column is Intrusion 195 / Identity 67 / Access 37 / Theft 15 /
+  Removal 4) and 0 rows with any of those Status verbs. `get_all_logs_formatted()` returns the same
+  318 documents before and after.
+- `streamlit_app.py`: `behavior_logged_ids`, `logged_general_ids`, `track_ids_logged_general` —
+  all three were written to and never read. Tuple arity of `setup_surveillance_memory` went 11 → 8;
+  verified by AST that the unpack site and the `return` still match.
+- `agents/reasoning_agent.py`: prompt no longer cites "Walking, Sitting" as example log kinds.
+- **`app.py` still contains all three dead sets** (lines 58-60, 193-194). Left untouched
+  deliberately — `app.py` is the out-of-scope legacy desktop variant.
 
 **Corrections to the record** (claims that were asserted and turned out to be untrue)
 - **"A comment noting `person_depth_filters` unbounded growth was added in Task 1c."** Never true.

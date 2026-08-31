@@ -8,44 +8,9 @@ A single-machine, offline-video surveillance analysis system. It ingests an uplo
 
 ## Table of Contents
 
-- [Quick Start for AI Agents](#quick-start-for-ai-agents)
-- [What This System Actually Does](#what-this-system-actually-does)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [Execution Flow](#execution-flow)
-- [Component Reference](#component-reference)
-- [AI / ML Components](#ai--ml-components)
-- [Configuration Reference](#configuration-reference)
-- [Environment Variables and Secrets](#environment-variables-and-secrets)
-- [Data Storage](#data-storage)
-- [External Services](#external-services)
-- [Error Handling](#error-handling)
-- [Setup and Running](#setup-and-running)
-- [How to Safely Modify This Project](#how-to-safely-modify-this-project)
-- [Coupling and Invariants](#coupling-and-invariants)
-- [Known Limitations / Unclear Areas](#known-limitations--unclear-areas)
-- [AI Development Context](#ai-development-context)
 
----
-
-## Quick Start for AI Agents
-
-Read these files, in this order, before changing anything:
-
-1. **`README.md`** (this file) — mental model + configuration map.
-2. **[config.py](config.py)** — every tunable that lives outside the modules. 74 lines, read it fully.
-3. **[streamlit_app.py](streamlit_app.py)** — the entry point and the *entire* orchestration loop. All surveillance business logic (identity state machine, intrusion persistence, theft attribution, logging decisions) lives in `run_surveillance()` at [streamlit_app.py:180-620](streamlit_app.py#L180-L620). This is the single most important function in the repo.
-4. **[vision/detector.py](vision/detector.py)** — the per-frame detection+tracking+ReID entry point (`PoseDetector.track_and_detect`).
-5. **[vision/pose_analyzer.py](vision/pose_analyzer.py)** — zone-intrusion and theft geometry, MiDaS depth, homography re-alignment.
-6. **[vision/identity_guardian.py](vision/identity_guardian.py)** — ID-switch correction; also holds its own hardcoded thresholds (they are **not** in `config.py`).
-7. **[vision/face_recognition.py](vision/face_recognition.py)** — DeepFace/ArcFace enrolment + matching.
-8. **[storage/event_logger.py](storage/event_logger.py)** + **[utils/csv_utils.py](utils/csv_utils.py)** — the CSV is the interface between the vision half and the LLM half.
-9. **[agents/reasoning_agent.py](agents/reasoning_agent.py)** + **[agents/retriever.py](agents/retriever.py)** — the RAG chain and the prompt.
-
-If your task is **vision tuning** → 2, 3, 5, 6.
-If your task is **identity / re-ID** → 3, 4, 6, 7.
+- [VLM Activity Recognition](#vlm-activity-recognition)
 If your task is **chatbot / reporting** → 8, 9.
-If your task is **UI** → 3 and [utils/heatmap.py](utils/heatmap.py).
 
 ---
 
@@ -74,7 +39,6 @@ If your task is **UI** → 3 and [utils/heatmap.py](utils/heatmap.py).
 ```mermaid
 flowchart TD
     subgraph UI["streamlit_app.py (entry point + orchestrator)"]
-        UP[Sidebar upload] --> ZONE[Tab 1: Zone Setup<br/>st_canvas]
         ZONE --> LOOP[Tab 2: run_surveillance loop]
         LOOP --> CHAT[Tab 3: Shelby Analyst]
         LOOP --> HEAT[Tab 4: Heatmap/Trajectory]
@@ -85,10 +49,6 @@ flowchart TD
         TRK[StrongSortTracker<br/>boxmot BotSort + OSNet]
         GUARD[IdentityGuardian<br/>HSV+edge histogram ReID]
         POSE[PoseAnalyzer<br/>MiDaS depth, ORB homography, theft]
-        FACE[FaceIdentifier<br/>DeepFace ArcFace]
-    end
-
-    subgraph STORE["storage/ + data/"]
         CSV[(storage/event_logs.csv)]
         PKL[(data/embeddings/face_embeddings.pkl)]
         SNAP[(data/reid_snapshots/&lt;id&gt;/)]
@@ -121,20 +81,11 @@ flowchart TD
 ---
 
 ## Project Structure
-
-```text
-SurveillanceSystem/
 ├── streamlit_app.py          # ENTRY POINT. UI + the entire surveillance orchestration loop.
 ├── app.py                    # Legacy OpenCV-desktop variant. Excluded from this document.
-├── config.py                 # All cross-module tunables + .env loading. Read this first.
-├── requirements.txt          # Dependency list (unpinned except numpy).
-├── .env                      # Secrets. Git-ignored. See "Environment Variables".
-│
-├── vision/
 │   ├── __init__.py           # Re-exports PoseDetector, PoseAnalyzer.
 │   ├── detector.py           # PoseDetector: YOLO -> tracker -> IdentityGuardian -> Results.
 │   ├── tracker.py            # StrongSortTracker: boxmot BotSort wrapper (name is historical).
-│   ├── identity_guardian.py  # Appearance-based ID-switch correction. Own hardcoded constants.
 │   ├── pose_analyzer.py      # MiDaS depth, KalmanSmoother, trespass check, ORB homography, theft.
 │   ├── face_recognition.py   # FaceIdentifier: ArcFace enrolment + cosine matching.
 │   ├── video_loader.py       # VideoLoader helper. UNUSED by streamlit_app.py.
@@ -329,10 +280,14 @@ sequenceDiagram
 | **Responsibility** | Single per-frame call producing an Ultralytics `Results` object with corrected, stable track IDs. |
 | **Input** | BGR numpy frame (any resolution). |
 | **Output** | `Results` with `.boxes` rebuilt as `[x1,y1,x2,y2,id,conf,cls]`, and `.keypoints` preserved. |
-| **Side effects** | Writes ReID snapshot JPEGs via `IdentityGuardian`. |
-| **Depends on** | `config.MODEL_PATH`, `config.CONFIDENCE_THRESHOLD`, `StrongSortTracker`, `IdentityGuardian`. |
+| **Side effects** | Writes ReID snapshot JPEGs via `IdentityGuardian` (if enabled). |
+| **Depends on** | `config.MODEL_PATH`, `config.CONFIDENCE_THRESHOLD`, `config.IDENTITY_GUARDIAN_ENABLED`, `StrongSortTracker`, `IdentityGuardian`. |
 
-Steps: YOLO (`classes=[0]`, person only) → `tracker.update()` → `guardian.update()` → **negative IDs are patched to `-(idx+1)`** so a display id always exists → `Boxes` tensor rebuilt. If YOLO returns nothing, it still calls `guardian.update` with empty arrays so the missing-frame counters keep ticking, then returns the raw result (which has `boxes.id is None`, so the caller's per-person loop is skipped).
+Steps: YOLO (`classes=[0]`, person only) → `tracker.update()` → **empty-frame guard** (if result is empty, clock advances but tracking is skipped) → `guardian.update()` (if `config.IDENTITY_GUARDIAN_ENABLED=True`) → **ephemeral IDs reassigned via monotonic counter** so unmatched detections get unique negative IDs `-(idx+1)` never reused within a frame, barring negative IDs from all state dicts → `Boxes` tensor rebuilt. Negative track IDs do not accumulate intrusion persistence, face identity, trajectory, or zone attribution — they are drawn and evaluated for the current frame only.
+
+**Phase 1 hardening changes (CLAUDE.md):**
+- **Ephemeral ID collision fix (VF-9, VF-21):** Unmatched detections now get unique negative IDs via a monotonic counter instead of `-(idx+1)` which would collide (all position-0 detections became `-1`). Measured: colliding detections **244→0, 155→0, 33→0** across three clips. Negative IDs are now guarded against accumulating state.
+- **Empty-frame freeze fix (VF-23, VF-24):** Added guard `if result.boxes is None or len(result.boxes) == 0: return result` to advance `guardian` state even when detection returns empty, because tracker state must advance even during occlusion. Call site in `detector.py`; `tracker.py` has a separate identical guard.
 
 ### `StrongSortTracker` ([vision/tracker.py](vision/tracker.py))
 
@@ -340,12 +295,17 @@ The class name is historical — it wraps **`boxmot.trackers.botsort.botsort.Bot
 
 - `update(xyxy, confidences, frame, keypoints=None)` → `np.ndarray` of per-detection track IDs, `-1` where unmatched. `keypoints` is accepted and immediately `del`eted — API compatibility only.
 - boxmot is fed `[x1,y1,x2,y2,conf,cls]` with `cls` forced to 0.
+- **Empty-frame guard (Phase 1 VF-23, VF-24):** Fallback guard here also advances clock so lost tracks decay even during gaps, preventing frozen-clock artefacts.
 - `_tracker_update` tries three call signatures (`(dets, frame)`, `dets=/img=`, `dets=/im=`) in order — defensive coding against boxmot API drift.
-- `_assign_tracks_to_detections` does **greedy IoU** matching between boxmot's returned track boxes and the original detection order, because the caller needs IDs aligned to YOLO's box order. Threshold: `config.TRACKER_MATCH_IOU_THRESHOLD` (not defined in config.py → default `0.2`).
+- `_assign_tracks_to_detections` does **greedy IoU** matching between boxmot's returned track boxes and the original detection order, because the caller needs IDs aligned to YOLO's box order. Threshold: `config.TRACKER_MATCH_IOU_THRESHOLD` (default `0.2`).
 
 ### `IdentityGuardian` ([vision/identity_guardian.py](vision/identity_guardian.py))
 
-Sits *after* BotSort and reverts ID switches. When a track ID appears that was not present in the previous frame, its appearance embedding is compared against the mean embedding of every known-but-currently-absent ID; if cosine similarity > `REID_SIMILARITY_THRESHOLD`, the new ID is permanently remapped to the old one via `self._id_map`.
+**Phase 1 status: DISABLED BY DEFAULT** — gated behind `config.IDENTITY_GUARDIAN_ENABLED` (default `False`). Class and all logic remain fully intact; bypassed in detector if flag is False.
+
+When enabled, sits *after* BotSort and reverts ID switches. When a track ID appears that was not present in the previous frame, its appearance embedding is compared against the mean embedding of every known-but-currently-absent ID; if cosine similarity > `REID_SIMILARITY_THRESHOLD`, the new ID is permanently remapped to the old one via `self._id_map`. 
+
+**Phase 1 measurement (VF-6, VF-12):** Guardian was over-merging visibly different people (bright yellow hoodie merged with dark jackets; 5 distinct people merged into 1 identity). Disabling it does not affect **tracking** quality (VF-11) — only **attribution**. Verified: with Guardian ON/OFF, track-lifetime distributions are byte-identical across all test clips.
 
 Embedding (all thresholds hardcoded in this file, **not** in `config.py`):
 
@@ -366,12 +326,12 @@ Note the edge band counts are raw sums concatenated with normalized histograms *
 
 | Method | Does |
 |---|---|
-| `__init__(reference_frame)` | Stores grayscale frame 0, computes ORB reference keypoints, **loads MiDaS via `torch.hub`** (requires internet on first ever run; cached in `~/.cache/torch/hub`). |
-| `get_depth_map(frame)` | MiDaS forward pass → bicubic upsample to frame size → **min-max normalized to 0..1** (relative depth, *not* metric). |
-| `check_trespassing(kpts, bbox, zones, depth_map, person_id)` | The intrusion decision. Returns `True` on the first keypoint that is inside a zone in 2D *and* inside the zone's depth band. |
-| `check_2d_overlap(bbox, zones)` | Pure rectangle-intersection test on `z['coords']`. Used as the MiDaS gate and the theft gate. |
-| `align_zones(frame, zones)` | ORB→BFMatcher(Hamming, crossCheck)→RANSAC homography; rewrites `z['coords']` / `z['polygon']` from the originals. Mutates and returns `zones`. |
-| `detect_theft(frame, zone)` | Grid edge-density comparison (see below). Mutates `zone['missing_counter']`. |
+| `__init__(reference_frame)` | Stores grayscale frame 0, computes ORB reference keypoints, **loads MiDaS via lazy singleton** (thread-safe, keyed by model type + device; subsequent runs reuse model). Requires internet on first ever run; cached in `~/.cache/torch/hub`. Phase 1 VF-32: second in-process run reduced load from 3.34s → 0.015s (223x speedup). |
+| `get_depth_map(frame)` | MiDaS forward pass → bicubic upsample → **min-max normalized per-frame to 0..1** (relative depth, *not* metric). |
+| `check_trespassing(kpts, bbox, zones, depth_map, person_id)` | Intrusion decision: returns `True` on first keypoint inside zone in 2D *and* inside zone's depth band. |
+| `check_2d_overlap(bbox, zones)` | Pure rectangle-intersection test on `z['coords']`. MiDaS gate and theft gate. |
+| `align_zones(frame, zones)` | **Phase 1: GATED AND DISABLED BY DEFAULT** — controlled by `config.ZONE_ALIGN_ENABLED` (default `False`) and `config.ZONE_ALIGN_INTERVAL` (default `15`). When enabled: ORB→BFMatcher(Hamming, crossCheck)→RANSAC homography rewrites `z['coords']`/`z['polygon']`. Measured cost (VF-34): 47.6 ms/call (33% of frame budget). Phase 1 VF-41 end-to-end speed-up: alignment OFF raised throughput from 7.2 fps to ~10.6 fps on target clip. **Known bug (VF-37, OQ-17):** fails silently on crowd footage by matching moving people instead of camera motion, throwing zones thousands of px off-screen with zero failure warnings. Dormant only because alignment now OFF by default. Must be fixed before re-enabling (needs homography sanity check). |
+| `detect_theft(frame, zone)` | Grid edge-density comparison. Mutates `zone['missing_counter']`. |
 
 **Depth band construction** (per zone, per frame): `raw_obj_z = median(zone_roi)` smoothed by a per-zone `KalmanSmoother(Q=0.001, R=0.1)`; `structural_spread = (p85 - p15) / 2`; band = `object_z ± (config.DEPTH_TOLERANCE + structural_spread)`. Each candidate keypoint's depth is smoothed by its own `KalmanSmoother(Q=0.005, R=0.3)` keyed `f"{person_id}_{zone_type}_{kp_index}"`. **These filter dicts are never pruned**, so they grow with the number of distinct track IDs seen.
 
@@ -426,10 +386,10 @@ Pure functions, no Streamlit imports, independently testable. `record_position` 
 | 5 | **ArcFace** (DeepFace) | [vision/face_recognition.py](vision/face_recognition.py) | deepface 0.0.99 on tensorflow 2.15 / tf-keras | Face identification against enrolled photos |
 | 6 | **text-embedding-3-small** | [agents/retriever.py:12](agents/retriever.py#L12) | OpenAI, via `langchain_openai.OpenAIEmbeddings` | Log-sentence embeddings for retrieval |
 | 7 | **gpt-4o-mini** | [agents/reasoning_agent.py:17](agents/reasoning_agent.py#L17) | OpenAI, via `langchain_openai.ChatOpenAI`, `temperature=0.4` | Natural-language forensic answers |
+| 8 | **gpt-4o-mini** (vision) | [vision/vlm_activity_analyzer.py](vision/vlm_activity_analyzer.py) | OpenAI, via `OpenAI()` client with vision API | Human activity recognition for tracked people |
 
 ### Input / output contracts
 
-- **YOLO →** `Results` with `boxes.xyxy (N,4)`, `boxes.conf (N,)`, `keypoints.xy (N,17,2)`, `keypoints.conf (N,17)`. Keypoint indices used across the codebase: `0-4` face, `9,10` wrists, `15,16` ankles, plus `config.SKELETON_EDGES` for drawing.
 - **MiDaS →** float32 `(H, W)` array **normalized per frame to 0..1**. Because normalization is per-frame, depth values are **not comparable across frames** — this is why the Kalman smoothers and the percentile-based `structural_spread` exist.
 - **ArcFace →** 512-float list from `DeepFace.represent(...)[0]["embedding"]`. Compared with cosine *distance*; lower = more similar.
 - **OpenAI embeddings →** consumed only by Chroma; never inspected by our code.
@@ -470,16 +430,20 @@ The entire prompt lives inline in [agents/reasoning_agent.py:26-75](agents/reaso
 | `EMBEDDINGS_PATH` | `data/embeddings/face_embeddings.pkl` | Cached ArcFace vectors. **Delete this file to force re-enrolment** | Yes |
 | `REID_SNAPSHOT_ROOT` | `data/reid_snapshots` | Guardian snapshot JPEGs | Yes |
 | `VECTOR_DB_PATH` | `data/embeddings/chroma_db` | Chroma persistence dir; wiped on each ingest | Yes |
-| `ACTION_MODEL_PATH` | `data/weights/st_gcn.kinetics.pt` | **Unused** — the action recognizer was deleted in commit `760a6c2` | Yes (dead) |
 
-### `config.py` — detection & tracking
+### `config.py` — detection & tracking (Phase 1 hardening)
 
 | Name | Value | File used in | What it controls | Effect of change |
 |---|---|---|---|---|
-| `MODEL_PATH` | `"yolov8n-pose.pt"` | [detector.py:26](vision/detector.py#L26) | Which YOLO pose model loads. **Relative path** → resolved against the process CWD | `yolov8m-pose.pt` / `yolov8l-pose.pt` are present and would improve keypoint quality at a large FPS cost. Ultralytics downloads unknown names. |
-| `CONFIDENCE_THRESHOLD` | `0.45` | [detector.py:47](vision/detector.py#L47) | YOLO person-detection confidence floor | Lower → more distant/occluded people detected, more false tracks and more spurious IDs for the Guardian to merge. Higher → people drop out, breaking tracks. |
+| `MODEL_PATH` | `"yolov8n-pose.pt"` | [detector.py:26](vision/detector.py#L26) | Which YOLO pose model loads. **Relative path** → resolved against process CWD | `yolov8m-pose.pt` / `yolov8l-pose.pt` present; would improve keypoint quality at FPS cost. Ultralytics downloads unknown names. |
+| `CONFIDENCE_THRESHOLD` | `0.45` | [detector.py:47](vision/detector.py#L47) | YOLO person-detection confidence floor | Lower → more distant/occluded people, more false tracks. Higher → people drop out, breaking tracks. **Aligned with `TRACKER_NEW_TRACK_THRESH=0.45`** (Phase 1) to close confidence dead band (VF-19). |
+| `TRACKER_MAX_AGE` | `1200` (Phase 1 exposed) | [tracker.py:__init__](vision/tracker.py#L78-L95) | **INERT for removal** — governs `max_obs` only. Does NOT govern track removal (that's `track_buffer`). Comment records this so it won't be re-tuned. | Changing it has no measurable effect on tracking (VF-2). Kept exposed for visibility only. |
+| `TRACKER_TRACK_BUFFER` | `30` (Phase 1 exposed) | [tracker.py:__init__](vision/tracker.py#L78-L95) | **The actual removal lever.** Unmatched detections kept this many updates before discarding. | Removal boundary at 30→31 transitions (VF-1, OQ-10). |
+| `TRACKER_NEW_TRACK_THRESH` | `0.45` (Phase 1 changed from 0.6) | [tracker.py:__init__](vision/tracker.py#L78-L95) | Minimum confidence to spawn a new track. **Closes dead band from above.** | **Must stay aligned with `CONFIDENCE_THRESHOLD`** or band reopens (VF-19). Halves ephemeral detections, passes VF-13 regression (6 identities). |
+| `TRACKER_MATCH_IOU_THRESHOLD` | `0.2` (Phase 1 exposed) | [tracker.py:_assign_tracks_to_detections](vision/tracker.py#L110-L130) | Greedy IoU matching boxmot tracks to YOLO detections. | Measurement (VF-8): 0% of unmatched detections fail this threshold; all are starved (boxmot fewer boxes). Exposed for visibility. |
+| `IDENTITY_GUARDIAN_ENABLED` | `False` (Phase 1 default) | [detector.py:53-54](vision/detector.py#L53-L54) | Enable/disable appearance-based ID-switch correction | Guardian was over-merging (VF-6, VF-12). Disabled by default Phase 1. Does not affect tracking (VF-11), only attribution. |
 | `SKELETON_EDGES` | 12 COCO pairs | [video_utils.py:175](utils/video_utils.py#L175) | Skeleton drawing only | Cosmetic |
-| `MIN_KEYPOINT_CONFIDENCE` | `0.40` | [pose_analyzer.py:128](vision/pose_analyzer.py#L128) | Minimum keypoint confidence to *use a joint for the intrusion test* | Lower → hallucinated wrists can trigger intrusions. Higher → missed intrusions when hands are partly occluded. |
+| `MIN_KEYPOINT_CONFIDENCE` | `0.40` | [pose_analyzer.py:128](vision/pose_analyzer.py#L128) | Minimum keypoint confidence to *use a joint for intrusion test* | Lower → hallucinated joints trigger intrusions. Higher → misses with partial occlusion. |
 
 Detection-related hardcoded values not in `config.py`:
 
@@ -492,53 +456,59 @@ Detection-related hardcoded values not in `config.py`:
 | pad `0.5×w`, `0.6×h` | [face_recognition.py:90-91](vision/face_recognition.py#L90-L91) | Face crop expansion beyond the eyes/nose hull |
 | min crop `20×20` | [face_recognition.py:98](vision/face_recognition.py#L98) | Rejects tiny faces |
 
-### `vision/tracker.py` — BotSort parameters (constructor defaults, **not** in `config.py`)
+### `vision/tracker.py` — BotSort parameters (Phase 1 hardening: all four tracker knobs exposed)
 
 | Param | Value | Passed to BotSort as | Notes |
 |---|---|---|---|
-| `max_age` | `1200` | `max_age` | Frames a lost track is kept alive. At `FRAME_SKIP=2` on 30 fps footage this is ~80 s of wall-clock video. |
-| `n_init` | `1` | `min_hits` | A track is confirmed on its first detection → fast but noisy. |
+| `max_age` | **configurable via `config.TRACKER_MAX_AGE`** (default `1200`, exposed Phase 1) | `max_age` | **Inert for removal: does not govern track removal.** Governs `max_obs = max_age + 5` only. Track removal is actually governed by `track_buffer` (VF-1, VF-2). Comment records this so future maintainers do not re-try tuning it. |
+| `track_buffer` | **configurable via `config.TRACKER_TRACK_BUFFER`** (default `30`, exposed Phase 1) | **internal to boxmot** | **The actual removal lever** — unmatched detections kept alive for this many updates, then discarded. Removal boundary at 30→31 transitions (VF-1, OQ-10 ruled). |
+| `new_track_thresh` | **configurable via `config.TRACKER_NEW_TRACK_THRESH`** (default `0.45`, changed Phase 1) | `det_thresh` in `BotSort.__init__` but re-set here | **Closes confidence dead band from above (Mode B, VF-19).** Was 0.6, now 0.45 = `CONFIDENCE_THRESHOLD`. **Must stay aligned** or band reopens. Measured: halved ephemeral detections, passes VF-13 regression (6 identities, split at 430-448). |
+| `n_init` | `1` | `min_hits` | A track is confirmed on first detection → fast but noisy. |
 | `max_iou_distance` | `0.9` | `iou_threshold` | Very permissive association. |
 | `max_cosine_distance` | `0.55` | **nothing** | Accepted by `__init__` and never used. |
 | `nn_budget` | `150` | **nothing** | Accepted by `__init__` and never used. |
-| `det_thresh` | `0.3` | `det_thresh` | Hardcoded in the call, below `CONFIDENCE_THRESHOLD`, so it never binds. |
-| `max_obs` | `max_age + 5` = `1205` | `max_obs` | boxmot requires `> max_age`. |
-| `TRACKER_MATCH_IOU_THRESHOLD` | `0.2` (default; key absent from config.py) | greedy re-association | Minimum IoU to bind a boxmot track box back to a YOLO detection. |
+| `det_thresh` | `0.3` | `det_thresh` | Hardcoded in boxmot call, below `CONFIDENCE_THRESHOLD`, never binds. |
+| `max_obs` | `max_age + 5` | `max_obs` | boxmot requires `> max_age`. |
+| `TRACKER_MATCH_IOU_THRESHOLD` | **configurable via `config.TRACKER_MATCH_IOU_THRESHOLD`** (default `0.2`, exposed Phase 1) | greedy re-association | Minimum IoU to bind boxmot track box to YOLO detection. Measurement (VF-8): 0% of unmatched detections failed due to this; all were starved (boxmot returned fewer boxes). Exposed for visibility, not a working lever. |
 | `TRACKER_REID_WEIGHTS` / `STRONGSORT_REID_WEIGHTS` | absent → `osnet_x0_25_msmt17.pt` | ReID backbone | Add either key to `config.py` to override. |
 | `TRACKER_DEVICE` / `STRONGSORT_DEVICE` | absent → `cuda:0` if available else `cpu` | ReID device | |
 | `TRACKER_FP16` / `STRONGSORT_FP16` | absent → `torch.cuda.is_available()` | half precision | |
 
-### `vision/identity_guardian.py` — module-level constants (**not** in `config.py`)
+### `vision/identity_guardian.py` — module-level constants (**not** in `config.py`, Guardian disabled Phase 1)
 
 | Name | Value | Controls | Effect of change |
 |---|---|---|---|
-| `MIN_CROP_H` / `MIN_CROP_W` | `60` / `25` px | Minimum person crop to build an embedding | Raise → distant people are never enrolled (and never ReID-corrected). Lower → noisy embeddings, wrong merges. |
-| `FRAMES_MISSING_BEFORE_REID` | `1` | How long an ID must be absent to become a re-ID candidate | `1` means a single-frame gap already allows a merge — aggressive. |
-| `REID_SIMILARITY_THRESHOLD` | `0.82` | Cosine similarity floor to merge a new ID into an old one | **The most consequential ReID knob.** Lower → different people get merged into one identity, which will mislabel intrusion attribution. Higher → the same person accumulates several IDs. |
-| `MAX_FRAMES_MISSING` | `450` | Frames before an identity is retired (never matched again) | Comment says ~30 s at 15 fps effective. |
-| `MAX_SNAPSHOTS` | `8` | Rolling embeddings averaged per identity | More → more stable mean, slower adaptation to lighting change. |
-| `MIN_FRAMES_TO_ENROLL` | `2` | Consecutive frames before an embedding is built | Guards against half-visible first detections. |
+| `MIN_CROP_H` / `MIN_CROP_W` | `60` / `25` px | Minimum person crop to build embedding | Raise → distant people never enrolled. Lower → noisy embeddings, wrong merges. |
+| `FRAMES_MISSING_BEFORE_REID` | `1` | How long ID must be absent to become re-ID candidate | `1` = single-frame gap allows merge — aggressive. |
+| `REID_SIMILARITY_THRESHOLD` | `0.82` | Cosine similarity floor to merge new ID into old | **Most consequential ReID knob when Guardian enabled.** Lower → different people merge (wrong attribution). Higher → same person gets multiple IDs. Measurement shows 0.82 was over-aggressive (VF-6, VF-12). |
+| `MAX_FRAMES_MISSING` | `450` | Frames before identity retired | Effectively ~30 s at 15 fps. OSNet actually recovers within ~30 updates (~2 s); beyond that is unmeasured (OQ-7). |
+| `MAX_SNAPSHOTS` | `8` | Rolling embeddings averaged per identity | More → stable mean, slower lighting adaptation. Note: overwritten file is `snap_008.jpg`, not `snap_007.jpg` (VF-10). |
+| `MIN_FRAMES_TO_ENROLL` | `2` | Consecutive frames before embedding built | Guards half-visible first detections. |
 | Canny `(40, 120)` | [identity_guardian.py:112](vision/identity_guardian.py#L112) | Silhouette edge extraction | |
-| crop resize `(64, 128)` | [identity_guardian.py:92](vision/identity_guardian.py#L92) | Embedding input size | Changing it invalidates all previously stored embeddings in-process. |
+| crop resize `(64, 128)` | [identity_guardian.py:92](vision/identity_guardian.py#L92) | Embedding input size | Invalidates in-process embeddings if changed. |
 | region splits `12% / 50%` | [identity_guardian.py:99-108](vision/identity_guardian.py#L99-L108) | hair / shirt / trousers bands | |
+| **Edge block bug (VF-5)** | **VERIFIED: 100% silhouette** | Pre-normalisation edge energy median/p10/p90 = 100.00%, colour never participates | Embedding is pure silhouette outline, not appearance. Fix deferred (Task 6a) because Guardian now disabled. Revisit only if OQ-6 forces Guardian back. |
 
 The `REID_*` keys **in `config.py`** (`REID_SNAPSHOT_INTERVAL=25`, `REID_SNAPSHOT_MIN_COUNT=3`, `REID_EMBEDDING_MATCH_THRESHOLD=0.72`, `REID_EMBEDDING_FALLBACK_THRESHOLD=0.58`, `REID_EMBEDDING_DRIFT_THRESHOLD=0.48`, `REID_IDENTITY_MATCH_MARGIN=0.04`, `REID_MAX_EMBEDDINGS_PER_IDENTITY=30`, `REID_REASSIGN_GRACE_FRAMES=8`) are **read by nothing**. Only `REID_SNAPSHOT_ROOT` is used. Editing the others has no effect — the live equivalents are the module constants above.
 
-### `config.py` — depth / intrusion
+### `config.py` — depth / intrusion / zone alignment (Phase 1: alignment gated and disabled)
 
 | Name | Value | Controls | Effect of change |
 |---|---|---|---|
-| `DEPTH_MODEL_TYPE` | `"MiDaS_small"` | torch.hub model id | `"DPT_Hybrid"` / `"DPT_Large"` are handled (they switch the transform to `dpt_transform`) but are far slower. |
-| `DEPTH_TOLERANCE` | `0.10` | Base half-width of the accepted depth band, in **normalized depth units** (0–1, per-frame) | Larger → a hand further from the object still counts as touching → more intrusions. Smaller → misses. |
+| `DEPTH_MODEL_TYPE` | `"MiDaS_small"` | torch.hub model id | `"DPT_Hybrid"` / `"DPT_Large"` handled but far slower. |
+| `DEPTH_TOLERANCE` | `0.10` | Base half-width of accepted depth band in normalized 0–1 units (per-frame) | Larger → hand further from object counts as touch → more intrusions. Smaller → misses. |
+| `ZONE_ALIGN_ENABLED` | `False` (Phase 1 disabled) | Enable/disable ORB homography re-alignment | **Phase 1 gating (Task 3).** Was running every frame, costing 33% of frame budget (VF-34). Disabled by default. Known failure (VF-37, OQ-17): silently matches moving people on crowds, throwing zones off-screen. Must be fixed before re-enabling. |
+| `ZONE_ALIGN_INTERVAL` | `15` (Phase 1 exposed) | Recompute homography every N frames when enabled | Only affects behavior when `ZONE_ALIGN_ENABLED=True`. Measured (VF-36): interval 15 captures most of disabled benefit. |
+| `ZONE_ALIGN_NFEATURES` | `1000` (default, Phase 1 measured) | ORB feature budget | Measurement (VF-35): cost is O(n²) in features matching, plus ~21ms fixed floor (detection + grayscale). `ZONE_ALIGN_ENABLED=False` now moot, but logged for re-enabling path. |
 | `DEPTH_SCORE_THRESHOLD` | `0.70` | **Unused** | No effect |
 | `MAX_INTERACTION_SCALE` | `1.8` | **Unused** | No effect |
 | `MIN_INTERACTION_SCALE` | `0.6` | **Unused** | No effect |
-| Kalman zone filter | `Q=0.001, R=0.1` | [pose_analyzer.py:117](vision/pose_analyzer.py#L117) | Heavy smoothing of the zone's depth (zones are static) |
-| Kalman person filter | `Q=0.005, R=0.3` | [pose_analyzer.py:145](vision/pose_analyzer.py#L145) | Lighter smoothing of a wrist's depth |
-| percentiles `15` / `85` | [pose_analyzer.py:111-112](vision/pose_analyzer.py#L111-L112) | `structural_spread` — widens the band for depth-varied zones | |
-| `z_min, z_max = -1, 2` | [pose_analyzer.py:123](vision/pose_analyzer.py#L123) | **Depth-disabled fallback**: accepts any depth, i.e. pure 2D test | This is why intrusions still fire when MiDaS is skipped. |
+| Kalman zone filter | `Q=0.001, R=0.1` | [pose_analyzer.py:117](vision/pose_analyzer.py#L117) | Heavy smoothing of zone's depth (zones static) |
+| Kalman person filter | `Q=0.005, R=0.3` | [pose_analyzer.py:145](vision/pose_analyzer.py#L145) | Lighter smoothing of wrist's depth |
+| percentiles `15` / `85` | [pose_analyzer.py:111-112](vision/pose_analyzer.py#L111-L112) | `structural_spread` — widens band for depth-varied zones | |
+| `z_min, z_max = -1, 2` | [pose_analyzer.py:123](vision/pose_analyzer.py#L123) | **Depth-disabled fallback**: accepts any depth, pure 2D test | This is why intrusions fire when MiDaS skipped. |
 | ORB `nfeatures=1000` | [pose_analyzer.py:33](vision/pose_analyzer.py#L33) | Homography feature budget | |
-| `len(matches) > 10` | [pose_analyzer.py:180](vision/pose_analyzer.py#L180) | Minimum matches before re-aligning zones | Below this, zones keep their previous coordinates. |
+| `len(matches) > 10` | [pose_analyzer.py:180](vision/pose_analyzer.py#L180) | Minimum matches before re-aligning zones | Below this, zones keep previous coordinates. |
 | RANSAC reproj `5.0` | [pose_analyzer.py:185](vision/pose_analyzer.py#L185) | Homography outlier tolerance in px | |
 
 ### `config.py` — theft
@@ -569,10 +539,10 @@ The `REID_*` keys **in `config.py`** (`REID_SNAPSHOT_INTERVAL=25`, `REID_SNAPSHO
 
 | Name | Value | Line | Controls | Notes |
 |---|---|---|---|---|
-| `FRAME_SKIP` | `2` | [230](streamlit_app.py#L230) | Process every 2nd frame | The comment suggests 3 for weaker hardware. **Changing this shifts the real-time meaning of every frame-count threshold** (`THEFT_FRAME_PERSISTENCE`, `MAX_FRAMES_MISSING`, `FACE_*_INTERVAL`, `PERSISTENCE_THRESHOLD`). |
+| `FRAME_SKIP` | `2` | [230](streamlit_app.py#L230) | Process every 2nd frame | Measured (VF-38, VF-39): raising to 3 reaches real-time on only 1 of 3 test clips and degrades tracker refresh (15 Hz → 10 Hz) and track lifetimes. **RULED to stay at 2.** Shifting it changes real-time meaning of every frame-count threshold. At current 2, **end-to-end throughput is ~7.2 fps** (VF-31), below real-time for 30 fps camera. Phase 1 optimizations (alignment OFF, singleton MiDaS) raised to ~10.6 fps but still insufficient for live camera. |
 | `INFERENCE_WIDTH` | `640` | [235](streamlit_app.py#L235) | Downscale width for YOLO | Detections are scaled back up; drawing and depth use the full frame. |
 | `DEPTH_REFRESH_INTERVAL` | `5` | [240](streamlit_app.py#L240) | Recompute MiDaS every 5 processed frames when needed | Higher → cheaper but staler depth. |
-| `PERSISTENCE_THRESHOLD` | `5` | [847](streamlit_app.py#L847) (`setup_surveillance_memory`) | Consecutive trespassing frames before an intrusion is *confirmed* | The single knob for intrusion false-positive rate. |
+| `PERSISTENCE_THRESHOLD` | `5` | [847](streamlit_app.py#L847) (`setup_surveillance_memory`) | Consecutive trespassing frames before intrusion *confirmed* | The intrusion false-positive dial. Phase 1: old VF-13 baseline of 5 was partially a freeze artefact; corrected to **6 after fixing empty-frame clock** (VF-25). **New rule: office cctv must resolve to 6 tracks, split at frames 430-448** (track 4 ends 429, track 6 starts 450). Old "5" was correct for the wrong reason — now we keep the corrected number (VF-13). |
 | `target_display_interval` | `1 / min(native_fps/FRAME_SKIP, 30)` | [243](streamlit_app.py#L243) | Preview refresh cap | Display only; never affects analysis. |
 | `CAP_PROP_BUFFERSIZE` | `2` | [225](streamlit_app.py#L225) | OpenCV capture buffer | Meaningful for live sources; near-inert for files. |
 | `display_width` | `800` | [95](streamlit_app.py#L95) | Zone-drawing canvas width; sets `scale_factor` | Changing it changes the canvas→video coordinate mapping. |
@@ -851,15 +821,16 @@ Facts, verified by reading the code. Where intent is unclear, that is stated rat
 
 ### Verified defects
 
-1. **The API key never reaches OpenAI as configured.** `config.OPENAI_API_KEY = os.getenv("GOOGLE_API_KEY")`, but `.env` defines `OPENAI_API_KEY`. Passing an explicit `None` suppresses langchain's env fallback. Reproduced in `venv311` — details in [Environment Variables](#verified-defect-the-analyst-cannot-authenticate-as-configured).
-2. **`st.session_state.identity_map` is never populated.** `run_surveillance` builds a *local* `identity_map` ([streamlit_app.py:839](streamlit_app.py#L839)) and never writes it back. The Heatmap tab reads `session_state.identity_map` ([streamlit_app.py:661](streamlit_app.py#L661)), so heatmap person labels are **always** `Person_<id>`, even for recognized people.
-3. **"Stop Surveillance" cannot stop the loop.** `stop_btn` is evaluated once before `while cap.isOpened() and not stop_btn` and never re-read, so both the loop condition and the inner `if stop_btn: break` use a value fixed at `False`. Clicking the button triggers a Streamlit rerun, which is the only thing that actually halts processing.
-4. **Negative track IDs collide.** An unmatched detection at list position 0 always becomes `-1`. Two different unmatched people, in different frames, share ID `-1` and therefore share intrusion counters, face-candidate state, and heatmap tracks.
+1. **The API key never reaches OpenAI as configured.** `config.OPENAI_API_KEY = os.getenv("GOOGLE_API_KEY")`, but `.env` defines `OPENAI_API_KEY`. Passing explicit `None` suppresses langchain's env fallback. Reproduced in `venv311` — details in [Environment Variables](#verified-defect-the-analyst-cannot-authenticate-as-configured).
+2. ~~**`st.session_state.identity_map` is never populated.**~~ **Phase 1 Task 4 FIXED**: `run_surveillance` builds local `identity_map` and now writes it back to session_state at completion (VF-30).
+3. **"Stop Surveillance" cannot stop the loop.** `stop_btn` evaluated once before `while` and never re-read. Clicking triggers Streamlit rerun, the only thing that halts processing.
+4. ~~**Negative track IDs collide.**~~ **Phase 1 Task 1c FIXED (VF-9)**: unmatched detections now get unique IDs via monotonic counter. Was: all position-0 detections became `-1`. Now: colliding detections **244→0, 155→0, 33→0** across three clips.
+5. ~~**`run_surveillance` has no try/except; one bad frame aborts and leaks `cap`.**~~ **Phase 1 Task 4 FIXED (VF-30)**: per-frame try/except catches all frame exceptions, logs with frame number, aborts at 30 consecutive failures, total skipped count reported, `cap.release()` + `processing_complete` in `finally`. `KeyboardInterrupt`/`SystemExit` re-raised.
 
 ### Dead / unused code and configuration
 
 - **Empty files (0 bytes):** `agents/report_generator.py`, `chatbot/memory.py`, `chatbot/prompt_templates.py`, `vision/event_generator.py`, `vision/frame_processor.py`, `utils/time.utils.py` (also unimportable — the dot in the name), `storage/video_metadata.csv`, and all four `__init__.py` in `agents/`, `chatbot/`, `storage/`.
-- **Unused config keys:** `DEPTH_SCORE_THRESHOLD`, `MAX_INTERACTION_SCALE`, `MIN_INTERACTION_SCALE`, `COLOR_TRESPASSER`, `COLOR_DRAWING`, all eight `REID_EMBEDDING_*`/`REID_SNAPSHOT_INTERVAL`/`REID_SNAPSHOT_MIN_COUNT`/`REID_IDENTITY_MATCH_MARGIN`/`REID_MAX_EMBEDDINGS_PER_IDENTITY`/`REID_REASSIGN_GRACE_FRAMES`, `ACTION_MODEL_PATH`, `ACTION_WINDOW`, `RUNNING_VELOCITY_THRESHOLD`, `BENDING_RATIO_THRESHOLD`, `PICKUP_HAND_KNEE_RELATION`. The `ACTION_*` and behaviour keys belonged to `vision/action_recognizer.py`, deleted in commit `760a6c2`.
+- **Unused config keys:** `DEPTH_SCORE_THRESHOLD`, `MAX_INTERACTION_SCALE`, `MIN_INTERACTION_SCALE`, `COLOR_TRESPASSER`, `COLOR_DRAWING`, all eight `REID_EMBEDDING_*`/`REID_SNAPSHOT_INTERVAL`/`REID_SNAPSHOT_MIN_COUNT`/`REID_IDENTITY_MATCH_MARGIN`/`REID_MAX_EMBEDDINGS_PER_IDENTITY`/`REID_REASSIGN_GRACE_FRAMES`. The `ACTION_*` and behaviour-threshold keys belonged to `vision/action_recognizer.py` (deleted in commit `760a6c2`) and have now been removed from `config.py`; activity recognition is handled by `vision/vlm_activity_analyzer.py`.
 - **Unused code:** `results.is_trespassing = person_statuses` ([streamlit_app.py:532](streamlit_app.py#L532)) is set and never read. `behavior_logged_ids`, `logged_general_ids`, `track_ids_logged_general` are created and added to but never queried. `LogAnalyzer.get_recent_logs_as_text` and `get_statistics` are never called. `vision/video_loader.py`, `utils/polygon_utils.py`, and `ZoneSelector` in `utils/video_utils.py` belong to the desktop flow. `StrongSortTracker`'s `max_cosine_distance` and `nn_budget` arguments are accepted and discarded. `langchain-google-genai`, `einops`, and `tqdm` are in `requirements.txt` but imported nowhere.
 - **The `is_active=False` theft calls** ([streamlit_app.py:571-585](streamlit_app.py#L571-L585)) invoke `log_event` with `False`, which the method ignores entirely — they neither write nor clear state.
 
@@ -874,21 +845,42 @@ Facts, verified by reading the code. Where intent is unclear, that is stated rat
 
 ### Behavioural caveats
 
-- **Timestamps are wall-clock**, not video time. Analysing a 2-minute clip produces 2 minutes of timestamps starting at "now", so the analyst's day-of-week and time reasoning describes when you *ran* the analysis, not when the footage was recorded.
-- **Zone status is per-frame.** Every restricted zone resets to `SECURE` at the top of each frame, so an alert colour persists only while the condition holds.
-- **Theft detection is gated on nobody overlapping any zone in 2D.** A person standing in front of a monitored object suppresses theft detection entirely for that frame — intentional (occlusion would read as edge loss), but it means an object removed by someone who never leaves the frame is never reported.
-- **Depth is relative and per-frame normalized.** `DEPTH_TOLERANCE = 0.10` is 10% of that frame's depth range, not a distance in metres.
-- **Unbounded growth:** `PoseAnalyzer.person_depth_filters` / `zone_depth_filters`, `IdentityGuardian._embeddings` / `_frame_count` / `_missing`, `session_state.track_positions`, and `data/reid_snapshots/` all grow monotonically within (or across) runs and are never pruned. `IdentityGuardian` is explicitly rebuilt at the start of each run ([streamlit_app.py:214-218](streamlit_app.py#L214-L218)); the others are not.
-- **`align_zones` runs ORB detection on every processed frame** — a fixed per-frame CPU cost even when the camera never moves.
-- **`use_column_width`** is passed to `st.image` (deprecated in Streamlit ≥1.30 in favour of `use_container_width`); it still works in the installed 1.38.0 but emits warnings.
-- **Chroma is fully re-embedded on every analyst initialization**, which costs an OpenAI embeddings call per log row each time.
-- **`storage/event_logs.csv` is committed to the repository** and carries real (if synthetic-looking) event rows. `data/authorized_faces/Talha.jpeg` is git-ignored but present on disk.
+- **Timestamps are wall-clock**, not video time. Analysing a 2-minute clip produces 2 minutes of timestamps starting at "now", so analyst reasoning describes when you *ran* the analysis, not when footage recorded.
+- **Zone status is per-frame.** Every restricted zone resets to `SECURE` at top of each frame, so alert colour persists only while condition holds.
+- **Theft detection gated on nobody overlapping any zone in 2D.** A person in front of monitored object suppresses theft detection entirely — intentional (occlusion reads as edge loss), but object removed by someone never leaving frame is never reported.
+- **Depth is relative and per-frame normalized.** `DEPTH_TOLERANCE = 0.10` is 10% of that frame's depth range, not metres.
+- **Zone alignment disabled Phase 1 (VF-41).** Was running every frame at 47.6 ms/call (33% of budget). Now `ZONE_ALIGN_ENABLED=False` by default. When enabled, it fails silently on crowd footage by matching moving people, throwing zones thousands of pixels off-screen (VF-37, OQ-17 — needs sanity check before re-enabling).
+- **Unbounded growth:** `PoseAnalyzer.person_depth_filters` / `zone_depth_filters`, `IdentityGuardian._embeddings` / `_frame_count` / `_missing`, `session_state.track_positions`, and `data/reid_snapshots/` all grow monotonically and are never pruned. `IdentityGuardian` explicitly rebuilt at start of each run; others are not.
+- **`use_column_width`** passed to `st.image` (deprecated in Streamlit ≥1.30 for `use_container_width`); still works in installed 1.38.0 but emits warnings.
+- **Chroma fully re-embedded on every analyst initialization**, costing OpenAI embeddings call per log row each time.
+- **`storage/event_logs.csv` is committed to repository** and carries sample rows. `data/authorized_faces/Talha.jpeg` is git-ignored but present on disk.
 
 ### Not determinable from the current codebase
 
 - Why `THEFT_FRAME_PERSISTENCE` is 37 rather than a round number, why `cells_showing_loss >= 2`, why the reference patch is blurred with a 5×5 kernel while the current patch uses 3×3, and why `REID_SIMILARITY_THRESHOLD` is 0.82. The values are defined in the code, but their original rationale could not be determined from the repository.
 - Whether `data/processed_frames/` and `data/snapshots/` were intended for something specific — they exist, are empty, and nothing references them.
 - Whether the `REID_*` config keys are aspirational (a planned refactor of `IdentityGuardian`) or leftovers from a removed implementation. Git history shows `identity_guardian.py` was added in the same commit that shrank `config.py`, but no version of the file ever read them.
+
+---
+
+# Phase 1 Hardening Summary (CLAUDE.md)
+
+**Completed December 2024.** All changes verified by measurement, not code reading. See CLAUDE.md for full evidence (VF-1 through VF-41).
+
+| Task | Status | Changes | Evidence |
+|---|---|---|---|
+| **1c — Ephemeral ID collision fix** | ✅ DONE | Monotonic counter in `detector.py`; negative IDs barred from stateful dicts | Collisions 244→0, 155→0, 33→0 (VF-9, VF-21) |
+| **1b — Empty-frame tracker freeze** | ✅ DONE | Guards in **both** `detector.py` and `tracker.py`; clock advances during gaps | Gaps 31→32 consistent with removal threshold (VF-24). Old 5-identity count was freeze artefact; now 6 (VF-25, VF-13 rewritten). |
+| **1a — Tracker knobs exposed** | ✅ DONE | `TRACKER_MAX_AGE`, `TRACKER_TRACK_BUFFER`, `TRACKER_NEW_TRACK_THRESH`, `TRACKER_MATCH_IOU_THRESHOLD` all in `config.py` with comments | `max_age` confirmed inert (VF-1, VF-2). `track_buffer` is the actual removal lever. `new_track_thresh=0.45` closes dead band (VF-19). |
+| **1c-2 — Confidence dead band** | ✅ DONE | `TRACKER_NEW_TRACK_THRESH = 0.45` (aligned with `CONFIDENCE_THRESHOLD`) **committed** | Ephemeral detections 31%→15%, passes VF-13 regression (6 tracks, split at 430-448) (VF-19, VF-20). |
+| **Guardian A/B — IdentityGuardian flag** | ✅ DONE | `IDENTITY_GUARDIAN_ENABLED = False` (default) | Guardian over-merging (5 people → 1), disabled by default. Does not affect tracking quality (VF-11, VF-12). |
+| **2 — MiDaS singleton** | ✅ DONE | Lazy, thread-safe, keyed by (model type, device) | Second in-process run: 3.34s → 0.015s (VF-32). Per-run state unaffected. |
+| **3 — Zone alignment gated** | ✅ DONE | `ZONE_ALIGN_ENABLED=False`, `ZONE_ALIGN_INTERVAL=15` (gating tested) | 33-74% end-to-end speed-up when disabled (VF-36, VF-41). Known failure (VF-37, OQ-17) kept dormant by disable flag. |
+| **4 — Per-frame error handling** | ✅ DONE | try/except per frame; 30 consecutive abort; `finally` release + `processing_complete` | Tested with streamlit stubbed (VF-30). Byte-identical byte output after. |
+
+**Regression baseline at close:** office cctv → **6 tracks**, split 430-448, median life 147, 29 ephemeral (2.8%), 1050 detections. Throughput: **~10.6 fps** (vs 7.2 fps before optimizations).
+
+**Open for Phase 2:** OQ-9 (split intrusion attribution), OQ-17 (homography sanity check), OQ-6 (long-gap ReID gallery — K=0 on target, unmeasured on sparse new footage), OQ-12 (short-gap OSNet failure), OQ-14 (storage layer fatal error), OQ-15 (`processing_complete` ambiguity).
 
 ---
 
@@ -968,14 +960,17 @@ See [Coupling and Invariants](#coupling-and-invariants). The three that break th
 
 ### Do Not Assume
 
-- **Do not assume `config.py` values are live.** Roughly a third are read by nothing. Grep before tuning. The ReID thresholds that actually matter live in `vision/identity_guardian.py`.
-- **Do not assume the tracker is StrongSORT.** The class is named that; it wraps `boxmot.BotSort`.
-- **Do not assume Google/Gemini is used.** `langchain-google-genai` is installed and never imported; `GOOGLE_API_KEY` holds an OpenAI key; `EMBEDDING_MODEL_NAME`'s comment is wrong.
-- **Do not assume `app.py` and `streamlit_app.py` agree.** They are separate implementations of the same idea.
-- **Do not assume depth is metric.** MiDaS output is min-max normalized per frame.
-- **Do not assume timestamps relate to the footage.** They are `datetime.now()` at write time.
-- **Do not assume track IDs are positive or unique over time.** Unmatched detections get reused negative IDs.
-- **Do not assume behaviour events exist.** `LogAnalyzer` handles `Action == "Behavior"` rows, but the producer was deleted in commit `760a6c2`.
-- **Do not assume there are tests, Docker, or CI.** There are none — do not write commands that imply otherwise.
-- **Do not assume Python 3.13 works.** boxmot requires 3.11/3.12; the repo's `venv/` is 3.13 and cannot run the pipeline.
-- **Do not assume the heatmap tab shows names.** `session_state.identity_map` is never populated.
+- **Do not assume `config.py` values are live.** Roughly a third are read by nothing. Grep before tuning. ReID thresholds that actually matter live in `vision/identity_guardian.py`.
+- **Do not assume the tracker is StrongSORT.** Class named that; wraps `boxmot.BotSort`.
+- **Do not assume Google/Gemini is used.** `langchain-google-genai` installed and never imported; `GOOGLE_API_KEY` holds OpenAI key; embedding comment is wrong.
+- **Do not assume `app.py` and `streamlit_app.py` agree.** Separate implementations of same idea.
+- **Do not assume depth is metric.** MiDaS output is min-max normalized per frame (relative, not absolute).
+- **Do not assume timestamps relate to footage.** They are `datetime.now()` at write time.
+- **Do not assume track IDs positive or unique over time.** Unmatched get reused negative IDs. Phase 1: now unique per-frame via monotonic counter (VF-9).
+- **Do not assume behaviour events exist.** `LogAnalyzer` handles `Action == "Behavior"`, but producer deleted in commit `760a6c2`.
+- **Do not assume tests, Docker, or CI exist.** There are none.
+- **Do not assume Python 3.13 works.** boxmot requires 3.11/3.12; repo's `venv/` is 3.13 and cannot run pipeline.
+- **Do not assume Guardian is enabled.** Phase 1: default `False` due to over-merging (VF-6, VF-12).
+- **Do not assume zone alignment runs.** Phase 1: default `ZONE_ALIGN_ENABLED=False` due to 33% CPU cost and known failure on crowds (VF-37, OQ-17).
+- **Do not assume `max_age` governs removal.** Phase 1 VF-1, VF-2: it is inert. `track_buffer` is the actual lever.
+- **Do not assume the regression baseline is 5 identities on office cctv.** Phase 1: corrected to 6 after fixing empty-frame freeze (VF-25, VF-13). Old 5 was a freeze artefact. Must split at frames 430-448.

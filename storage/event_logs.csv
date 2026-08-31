@@ -312,3 +312,20 @@ Timestamp,Entity,Action,Status,Location
 2026-08-31 22:00:57,Talha,Access,AUTHORIZED,Restricted_1
 2026-08-31 22:01:10,Talha,Access,AUTHORIZED,Restricted_1
 2026-08-31 22:01:16,ASSET,Removal,BY_Talha,Restricted_1
+2026-09-01 00:37:32,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 00:47:47,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 00:54:55,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 00:57:30,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 01:03:20,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 01:07:45,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 01:57:37,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:10:28,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:20:43,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:21:16,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:21:18,ASSET,Theft,STOLEN,Restricted_1
+2026-09-01 02:22:08,Person_1,Intrusion,UNAUTHORIZED,Restricted_1
+2026-09-01 02:22:09,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:22:09,Talha,Access,AUTHORIZED,Restricted_1
+2026-09-01 02:23:26,Person_1,Intrusion,UNAUTHORIZED,Restricted_1
+2026-09-01 02:23:27,Person_1,Identity,Recognized as Talha,General Area
+2026-09-01 02:23:27,Talha,Access,AUTHORIZED,Restricted_1

@@ -144,17 +144,108 @@ REID_EMBEDDING_DRIFT_THRESHOLD = 0.48
 REID_IDENTITY_MATCH_MARGIN = 0.04
 REID_MAX_EMBEDDINGS_PER_IDENTITY = 30
 REID_REASSIGN_GRACE_FRAMES = 8
-# --- LLM / RAG CONFIGURATION (NEW) ---is the mebedding causing ther 
+# --- LLM / RAG CONFIGURATION (NEW) ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = GOOGLE_API_KEY 
 VECTOR_DB_PATH = os.path.join(BASE_DIR, "data", "embeddings", "chroma_db")
 # Models
 LLM_MODEL_NAME = "gpt-4o-mini"  
 EMBEDDING_MODEL_NAME = "text-embedding-3-small" # Standard Google Embeddings
-# --- ACTION RECOGNITION (ST-GCN) ---
-ACTION_MODEL_PATH = os.path.join(BASE_DIR, "data", "weights", "st_gcn.kinetics.pt")
-ACTION_WINDOW = 30
-# --- ENHANCED ACTION THRESHOLDS ---
-RUNNING_VELOCITY_THRESHOLD = 0.025  # How fast a person must move to be "Running."
-BENDING_RATIO_THRESHOLD = 0.7       # How much the body must fold to count as "Bending."
-PICKUP_HAND_KNEE_RELATION = 0.05    # Hands must be below knees to trigger "Picking Up"
+
+# --- VLM ACTIVITY RECOGNITION (Vision-Language Model) ---
+# Master switch for VLM-based human activity recognition.
+# When enabled, the system analyzes tracked person activities using OpenAI's
+# vision model, providing higher-level semantic understanding beyond pose.
+# Does NOT run on every frame; triggered at configurable intervals.
+VLM_ACTIVITY_ENABLED = True
+
+# Activity analysis trigger interval (processed frames).
+# At FRAME_SKIP=2 on 30fps footage, 30 frames ≈ 2 seconds of real time.
+# Lower values = more frequent analysis (more API calls, more latency).
+# Higher values = less frequent (cheaper but slower to detect activity changes).
+VLM_ACTIVITY_ANALYSIS_INTERVAL = 30
+
+# Temporal window size for frame buffering.
+# Tracks are kept in a sliding window of this many frames for context.
+# When analysis is triggered, frames are sampled from this window.
+VLM_ACTIVITY_WINDOW_SIZE = 30
+
+# Sample rate within the temporal window.
+# Sends every Nth frame to the VLM to reduce data volume and API cost.
+# Sample rate of 3 means frames 0, 3, 6, ... are included.
+# Value of 1 sends every frame (high data volume, better temporal resolution).
+VLM_ACTIVITY_SAMPLE_RATE = 3
+
+# VLM model to use for activity analysis.
+# Must be a vision-capable OpenAI model.
+VLM_MODEL_NAME = "gpt-4o-mini"
+
+# API timeout for VLM calls (seconds).
+# If a VLM request takes longer than this, it is aborted.
+# Set higher if you have poor connectivity; lower for responsive UI.
+VLM_ACTIVITY_API_TIMEOUT = 10.0
+
+# Minimum track age (frames) before activity analysis is attempted.
+# Very new tracks may have insufficient context for reliable analysis.
+# At FRAME_SKIP=2, 15 frames ≈ 1 second of real time.
+VLM_ACTIVITY_MIN_TRACK_AGE = 15
+
+# Only analyze tracks with at least this many unique positions in the buffer.
+# Prevents analyzing stationary people (e.g., always standing in same spot).
+# NOTE: read by nothing today. Kept as a documented intent, not a live knob.
+VLM_ACTIVITY_MIN_MOVEMENT = 5
+
+# --- VLM COST / RATE CONTROL ---
+# Measured prompt tokens for one call on real crops (gpt-4o-mini):
+#   11 images, detail=auto : 85,319   <-- blew the 200k tokens/min account limit
+#   11 images, detail=low  : 28,649
+#    5 images, detail=low  : 14,484
+#    4 images, detail=low  : 11,651
+# Every one of those settings returned the correct label ("sitting"), so the
+# cheap settings cost accuracy nothing on this footage.
+#
+# detail="low" bills a flat ~2833 tokens per image instead of tiling it. This is
+# the single biggest lever -- a 3x cut on its own. Set to None for full detail.
+VLM_ACTIVITY_IMAGE_DETAIL = "low"
+
+# Maximum images per call. Token cost is linear in this.
+VLM_ACTIVITY_MAX_IMAGES = 5
+
+# Wall-clock floor between VLM calls, across ALL tracks.
+# VLM_ACTIVITY_ANALYSIS_INTERVAL counts SOURCE frames, so its real-time meaning
+# changes with clip frame rate and machine speed -- it cannot bound API spend.
+# This can. Measured at 14,484 tokens/call:
+#   5.0s -> 13.3 calls/min -> 192,788 tok/min  (only 7k headroom -- too tight)
+#   6.0s -> ~10  calls/min -> ~145,000 tok/min (~55k left for the analyst)
+# The 200k/min limit is SHARED with the RAG analyst's embedding and chat calls,
+# so the VLM must not spend all of it. Raise this if you still see 429s.
+VLM_ACTIVITY_MIN_SECONDS_BETWEEN_CALLS = 6.0
+
+# On HTTP 429 the analyzer backs off globally, doubling per occurrence up to
+# this cap, and decays back down as calls start landing again.
+VLM_ACTIVITY_MAX_BACKOFF_SECONDS = 60.0
+
+# SDK-level retries. Kept low: the SDK sleeps inside our worker thread, holding
+# the per-track in-flight slot. Our own backoff handles rate limiting.
+VLM_ACTIVITY_API_MAX_RETRIES = 1
+
+# Longest side (pixels) of each image sent to the VLM, and JPEG quality.
+# The API tiles images internally, so sending source-resolution lossless PNG
+# only bought upload latency -- measured at ~4 MB per call before this was
+# added. Latency is what bounds label freshness, because only one analysis per
+# track is in flight at a time.
+VLM_ACTIVITY_MAX_IMAGE_SIDE = 512
+VLM_ACTIVITY_JPEG_QUALITY = 85
+
+# How long (in SOURCE frames) an activity label stays valid for display.
+# A VLM verdict describes the ~1 s window it was computed from, not the present.
+# Past this age the label is dropped rather than shown as if it were current --
+# a seated person was displaying "walking" from several seconds earlier because
+# results never expired.
+# MUST be >= the source frames that elapse between calls, or labels blank out
+# between refreshes: at the 6.0s floor and ~10 processed fps with FRAME_SKIP=2,
+# that is 6 * 10 * 2 = ~120 source frames. 200 leaves margin on slower machines
+# while still bounding how old a displayed label can be.
+VLM_ACTIVITY_LABEL_TTL = 200
+
+
