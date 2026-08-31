@@ -251,3 +251,64 @@ Timestamp,Entity,Action,Status,Location
 2026-08-31 03:53:12,Person_56,Intrusion,UNAUTHORIZED,TESTZONE
 2026-08-31 03:53:12,Person_61,Intrusion,UNAUTHORIZED,TESTZONE
 2026-08-31 03:53:13,Person_63,Intrusion,UNAUTHORIZED,TESTZONE
+2026-08-31 03:59:06,Person_3,Intrusion,UNAUTHORIZED,TESTZONE
+2026-08-31 03:59:08,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 03:59:32,Person_4,Intrusion,UNAUTHORIZED,TESTZONE
+2026-08-31 03:59:33,Person_4,Identity,Recognized as Talha,General Area
+2026-08-31 03:59:33,Talha,Access,AUTHORIZED,TESTZONE
+2026-08-31 03:59:36,Person_6,Intrusion,UNAUTHORIZED,TESTZONE
+2026-08-31 03:59:38,Person_6,Identity,Recognized as Talha,General Area
+2026-08-31 03:59:39,Talha,Access,AUTHORIZED,TESTZONE
+2026-08-31 03:59:42,Person_7,Intrusion,UNAUTHORIZED,TESTZONE
+2026-08-31 03:59:49,Person_7,Identity,Recognized as Talha,General Area
+2026-08-31 04:01:58,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 04:01:59,ASSET,Theft,STOLEN,Restricted_1
+2026-08-31 04:05:40,ASSET,Theft,STOLEN,Restricted_1
+2026-08-31 04:05:48,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 04:06:12,ASSET,Theft,STOLEN,Restricted_1
+2026-08-31 04:06:19,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 04:06:26,ASSET,Theft,STOLEN,Restricted_1
+2026-08-31 20:35:11,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:35:13,Talha,Access,AUTHORIZED,DESK
+2026-08-31 20:38:25,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:38:26,ASSET,Theft,STOLEN,DESK
+2026-08-31 20:38:40,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:38:40,ASSET,Theft,STOLEN,DESK
+2026-08-31 20:38:42,Talha,Access,AUTHORIZED,DESK
+2026-08-31 20:38:43,ASSET,Removal,BY_Talha,DESK
+2026-08-31 20:38:55,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:38:58,Talha,Access,AUTHORIZED,DESK
+2026-08-31 20:39:12,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:39:14,Talha,Access,AUTHORIZED,DESK
+2026-08-31 20:45:56,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:46:06,ASSET,Theft,STOLEN,Restricted_1
+2026-08-31 20:55:43,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 20:55:45,Talha,Access,AUTHORIZED,Restricted_1
+2026-08-31 20:56:01,ASSET,Removal,BY_Talha,Restricted_1
+2026-08-31 20:56:29,Person_5,Identity,Recognized as Talha,General Area
+2026-08-31 20:56:31,Talha,Access,AUTHORIZED,Restricted_1
+2026-08-31 20:56:47,ASSET,Removal,BY_Talha,Restricted_1
+2026-08-31 21:07:54,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:08:04,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:08:06,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 21:08:06,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:08:20,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:09:17,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:09:27,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:09:28,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 21:09:28,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:09:41,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:11:10,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:11:23,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 21:11:29,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:12:11,Person_1,Intrusion,UNAUTHORIZED,TOWER
+2026-08-31 21:12:22,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 21:12:30,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:12:34,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:12:41,Talha,Access,AUTHORIZED,TOWER
+2026-08-31 21:16:13,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 22:00:56,Person_1,Intrusion,UNAUTHORIZED,Restricted_1
+2026-08-31 22:00:57,Person_1,Identity,Recognized as Talha,General Area
+2026-08-31 22:00:57,Talha,Access,AUTHORIZED,Restricted_1
+2026-08-31 22:01:10,Talha,Access,AUTHORIZED,Restricted_1
+2026-08-31 22:01:16,ASSET,Removal,BY_Talha,Restricted_1

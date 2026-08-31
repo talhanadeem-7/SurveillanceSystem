@@ -56,7 +56,7 @@ ZONE_ALIGN_ENABLED = False
 ZONE_ALIGN_INTERVAL = 15
 # ORB feature budget. The cost is dominated by BFMatcher(crossCheck=True), which
 # is O(n^2) in this number, NOT by feature detection — which is why the per-call
-# cost is the same at 1080p and 640x480. Lowering this is a second, independent
+# cost is the same at 1080p and 640x480. Lowering this is a second, independent 
 # lever on alignment cost, but there is a fixed ~21 ms floor from ORB detection
 # that no reduction touches (VF-35).
 # Left at 1000: lowering to 300 is 56% cheaper and looked accurate (mean 0.30 px
