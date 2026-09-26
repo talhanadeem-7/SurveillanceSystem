@@ -837,3 +837,35 @@ deleted in commit `760a6c2`; the residue it left behind has now been removed:
 | `scratchpad/deadband_ab.py` | Detections / ephemeral % / lifetimes across the three dead-band modes, with the VF-13 regression check built in. |
 | `scratchpad/newtracks_045.py` | Isolates tracks that exist at one `new_track_thresh` but not another and scores them duplicate-vs-genuine. |
 | `scratchpad/baseline_reid.py [out.jsonl]` | Guardian stats baseline across the three clips. |
+
+
+## CPU performance validation ? 2026-09-23
+
+This update supersedes earlier CPU throughput/configuration notes above. See
+`docs/CPU_PERFORMANCE.md` for the measured table and reproduction steps.
+
+- USE_VLM is now the canonical switch (old name is an alias). Disabled-mode tests
+  verify no API client, executor, or crop buffering. Generation guards reject old
+  callbacks; EOF drains for up to three seconds. All three live-API sample runs
+  finished without outstanding requests.
+- Same-weight FP32 ONNX reduced isolated pose prediction from 41.46 to 25.00 ms.
+  Full Streamlit steady analyzed FPS, VLM off: sample12 11.72 -> 14.60, sample11
+  10.08 -> 11.84, sample20 13.34 -> 16.87. Ryzen 5 5600, CPU only, FRAME_SKIP=2.
+  No profiler in these comparisons; browser rendering/RTSP not measured.
+- Complete sample comparisons preserved detection counts and all IDs on 901
+  analyzed frames. ONNX coordinate differences were below 0.002 pixels.
+- PyTorch versus ONNX/fused OSNet regression: office cctv retains six tracks
+  and 29 ephemeral detections; crowd sample 27/117; crowded sample2 43/124.
+  All per-frame IDs and lifetime distributions matched.
+- OSNet fusion, cached zone statistics/reference edges, vectorized theft grids,
+  grab/retrieve skipping, independent preview throttling, and bounded histories
+  are implemented. Models/thresholds/ReID cadence were preserved. CPU threads
+  are configurable; four won the local small-model sweep by a small margin.
+- 22 unit tests passed. Final same-session sample12 rerun check passed twice
+  (209 analyzed frames per run, no errors, disabled VLM has no executor).
+- app.py and chatbot/RAG execution remained excluded. Analyst startup is now
+  explicit; repeated surveillance starts use fresh tracker/identity/zone state.
+- Still an uploaded-file UI. Live RTSP capture/reconnect/backpressure and a
+  responsive independent stop control remain work for deployment.
+- Test scripts/logs/crops/JSON folders were removed after validation. Generated
+  ONNX deployment weights and manifest remain in data/models (Git-ignored).

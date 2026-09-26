@@ -8,7 +8,25 @@ VIDEO_DIR = os.path.join(BASE_DIR, "data", "uploaded_videos")
 LOG_PATH = os.path.join(BASE_DIR, "storage", "event_logs.csv")
 # Model Configuration
 MODEL_PATH = "yolov8n-pose.pt"
+YOLO_CPU_BACKEND = "onnx"  # Falls back to PyTorch if a validated export is absent.
+YOLO_CPU_MODEL_DIR = os.path.join(BASE_DIR, "data", "models")
+CPU_ONNX_THREADS = 4
 CONFIDENCE_THRESHOLD = 0.45
+# CPU execution only; these settings do not opt any model into CUDA.
+VISION_DEVICE = "cpu"
+TRACKER_DEVICE = "cpu"
+TRACKER_FP16 = False
+CPU_TORCH_THREADS = 4
+CPU_OPENCV_THREADS = 1
+TRACKER_FUSE_OSNET = True  # Fold eval BatchNorm into convolutions, retaining FP32.
+FRAME_SKIP = 2
+INFERENCE_WIDTH = 640
+PREVIEW_FPS = 10.0
+# Source-frame interval: preserves the existing refresh cadence at FRAME_SKIP=2.
+DEPTH_REFRESH_INTERVAL = 5
+INACTIVE_TRACK_TTL = 600  # Source frames; greater than the tracker's lost-track buffer.
+HEATMAP_MAX_POINTS_PER_TRACK = 18000
+HEATMAP_MAX_TRACKS = 256
 # Visual Colors (BGR)
 COLOR_SECURE = (0, 255, 0)         # Green
 COLOR_UNAUTHORIZED = (0, 165, 255) # Orange
@@ -157,10 +175,14 @@ EMBEDDING_MODEL_NAME = "text-embedding-3-small" # Standard Google Embeddings
 # When enabled, the system analyzes tracked person activities using OpenAI's
 # vision model, providing higher-level semantic understanding beyond pose.
 # Does NOT run on every frame; triggered at configurable intervals.
-VLM_ACTIVITY_ENABLED = True
+USE_VLM = True
+# Compatibility for older entry points; USE_VLM is the canonical setting.
+VLM_ACTIVITY_ENABLED = USE_VLM
+VLM_SHUTDOWN_TIMEOUT = 3.0
+VLM_INACTIVE_TRACK_TTL = 300  # Source frames.
 
-# Activity analysis trigger interval (processed frames).
-# At FRAME_SKIP=2 on 30fps footage, 30 frames ≈ 2 seconds of real time.
+# Activity analysis trigger interval (source frames).
+# 30 source frames = 1 second at 30 FPS, or 0.5 seconds at 60 FPS.
 # Lower values = more frequent analysis (more API calls, more latency).
 # Higher values = less frequent (cheaper but slower to detect activity changes).
 VLM_ACTIVITY_ANALYSIS_INTERVAL = 30

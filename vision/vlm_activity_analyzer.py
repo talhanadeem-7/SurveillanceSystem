@@ -26,7 +26,7 @@ from collections import defaultdict
 import datetime
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 import config
 
@@ -99,7 +99,15 @@ class ActivityFrameBuffer:
     def add_frame(self, track_id: int, frame: np.ndarray, frame_id: int, bbox=None):
         """Add a frame for a tracked person. If bbox is given, store the crop."""
         buf = self.buffers[track_id]
-        buf["frames"].append(self._crop_person(frame, bbox))
+        crop = self._crop_person(frame, bbox)
+        # Store the same resolution that will be sent, not 30 full-size crops.
+        max_side = getattr(config, "VLM_ACTIVITY_MAX_IMAGE_SIDE", 512)
+        h, w = crop.shape[:2]
+        if max_side and max(h, w) > max_side:
+            scale = max_side / max(h, w)
+            crop = cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
+                              interpolation=cv2.INTER_AREA)
+        buf["frames"].append(crop)
         buf["frame_ids"].append(frame_id)
 
         # Keep buffer size bounded
@@ -202,9 +210,9 @@ class VLMActivityAnalyzer:
         Args:
             enabled: Whether VLM activity analysis is active
         """
-        self.enabled = enabled and getattr(
-            config, "VLM_ACTIVITY_ENABLED", True
-        )
+        self.enabled = bool(enabled and getattr(
+            config, "USE_VLM", getattr(config, "VLM_ACTIVITY_ENABLED", True)
+        ))
         self.frame_buffer = ActivityFrameBuffer(
             window_size=getattr(config, "VLM_ACTIVITY_WINDOW_SIZE", 30),
             sample_rate=getattr(config, "VLM_ACTIVITY_SAMPLE_RATE", 3),
@@ -227,7 +235,10 @@ class VLMActivityAnalyzer:
         # e.g. an instant exception with no network or an immediate HTTP 429.
         self._lock = threading.RLock()
         self._pending_futures: Dict[int, Future] = {}
-        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vlm-activity")
+        self._executor = None
+        self._generation = 0
+        self._closed = False
+        self._last_seen = {}
 
         # --- TOKENS-PER-MINUTE THROTTLE -------------------------------------
         # The frame-based interval alone cannot bound API spend: it counts SOURCE
@@ -257,6 +268,7 @@ class VLMActivityAnalyzer:
                     api_key=config.OPENAI_API_KEY,
                     max_retries=getattr(config, "VLM_ACTIVITY_API_MAX_RETRIES", 1),
                 )
+                self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-activity")
                 logger.info("VLMActivityAnalyzer initialized (enabled)")
             except Exception as e:
                 logger.error(f"Failed to initialize OpenAI client for VLM: {e}")
@@ -274,9 +286,11 @@ class VLMActivityAnalyzer:
         scene. Without it the model cannot tell which person the prompt's track
         id refers to once more than one person is in shot.
         """
-        if not self.enabled:
-            return
-        self.frame_buffer.add_frame(track_id, frame, frame_id, bbox)
+        with self._lock:
+            if not self.enabled or self._closed:
+                return
+            self._last_seen[track_id] = frame_id
+            self.frame_buffer.add_frame(track_id, frame, frame_id, bbox)
 
     def analyze_if_ready(
         self, track_id: int, current_frame_id: int
@@ -287,7 +301,7 @@ class VLMActivityAnalyzer:
         Returns:
             ActivityResult if analysis completed, None otherwise.
         """
-        if not self.enabled or not self.client:
+        if not self.enabled or not self.client or self._closed:
             return None
 
         if not self.frame_buffer.should_analyze(
@@ -303,18 +317,10 @@ class VLMActivityAnalyzer:
         # leaving 4 s unanalysed between calls. That is what made a seated person
         # keep the "walking" label from several seconds earlier. Removed.
 
-        # Prepare sample
-        sample = self.frame_buffer.get_sample_for_analysis(track_id)
-        if not sample:
-            return None
-
-        # Don't judge a track that has barely been seen.
-        min_age = getattr(config, "VLM_ACTIVITY_MIN_TRACK_AGE", 0)
-        if sample.get("original_buffer_size", min_age) < min_age:
-            return self.activity_cache.get(track_id)
-
         # Submit the network call so the surveillance loop never waits for it.
         with self._lock:
+            if self._closed:
+                return None
             if track_id in self._pending_futures:
                 return self.activity_cache.get(track_id)
 
@@ -326,6 +332,14 @@ class VLMActivityAnalyzer:
                 return self.activity_cache.get(track_id)
             if now - self._last_call_time < self.min_seconds_between_calls:
                 return self.activity_cache.get(track_id)
+
+            # Copy/sample only when a request can actually be submitted.
+            sample = self.frame_buffer.get_sample_for_analysis(track_id)
+            if not sample:
+                return None
+            min_age = getattr(config, "VLM_ACTIVITY_MIN_TRACK_AGE", 0)
+            if sample.get("original_buffer_size", min_age) < min_age:
+                return self.activity_cache.get(track_id)
             self._last_call_time = now
 
             future = self._executor.submit(
@@ -335,30 +349,35 @@ class VLMActivityAnalyzer:
                 sample["frame_ids"],
             )
             self._pending_futures[track_id] = future
+            generation = self._generation
             future.add_done_callback(
                 lambda completed: self._complete_analysis(
-                    track_id, current_frame_id, completed
+                    track_id, current_frame_id, completed, generation
                 )
             )
 
         return self.activity_cache.get(track_id)
 
     def _complete_analysis(
-        self, track_id: int, frame_id: int, future: Future
+        self, track_id: int, frame_id: int, future: Future, generation: int
     ):
         """Store a completed result without propagating worker errors."""
+        if future.cancelled():
+            return
         try:
             result = future.result()
-            if result:
-                with self._lock:
+            with self._lock:
+                if generation != self._generation or self._pending_futures.get(track_id) is not future:
+                    return
+                if result:
                     self.activity_cache[track_id] = result
-                logger.debug(f"Activity analyzed for track {track_id}: {result.activity}")
         except Exception as e:
             logger.warning(f"VLM activity analysis failed for track {track_id}: {e}")
         finally:
             with self._lock:
-                self._pending_futures.pop(track_id, None)
-            self.frame_buffer.mark_analyzed(track_id, frame_id)
+                if generation == self._generation and self._pending_futures.get(track_id) is future:
+                    self._pending_futures.pop(track_id, None)
+                    self.frame_buffer.mark_analyzed(track_id, frame_id)
 
     def _invoke_vlm(
         self, track_id: int, frames: List[np.ndarray], frame_ids: List[int]
@@ -475,6 +494,11 @@ INSTRUCTIONS:
 1. Carefully observe the sequence of frames and identify the person's primary activity.
 2. Focus on observable actions and movements only. Do NOT invent or assume actions.
 3. The frames are sampled from a sliding window, so there may be gaps in time.
+   These are padded crops of one target person. Focus on the central person
+   consistently present across frames, not another person entering the crop.
+   If the target is ambiguous or occluded, return unknown with low confidence.
+   Distinguish visible posture (standing/sitting) from locomotion (walking/running).
+   Do not infer conversation, intent, or device operation from proximity alone.
 4. Return your analysis as a JSON object with the following structure:
 {{
     "activity": "<activity_label>",
@@ -583,18 +607,69 @@ CRITICAL RULES:
 
     def cleanup_track(self, track_id: int):
         """Remove track from buffers and cache."""
-        self.frame_buffer.cleanup_track(track_id)
         with self._lock:
+            self.frame_buffer.cleanup_track(track_id)
+            self._last_seen.pop(track_id, None)
             self.activity_cache.pop(track_id, None)
             pending = self._pending_futures.pop(track_id, None)
             if pending:
                 pending.cancel()
 
     def reset(self):
-        """Clear all cached activities and buffers."""
-        self.frame_buffer.buffers.clear()
+        """Start a new run; callbacks from the old run cannot repopulate it."""
         with self._lock:
+            self._generation += 1
+            self.frame_buffer.buffers.clear()
+            self._last_seen.clear()
             self.activity_cache.clear()
-            for future in self._pending_futures.values():
-                future.cancel()
+            pending = list(self._pending_futures.values())
             self._pending_futures.clear()
+            for future in pending:
+                future.cancel()
+            if self.enabled and self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-activity")
+            self._closed = False
+
+    def cleanup_inactive(self, current_frame_id: int):
+        """Bound crop memory while preserving short tracker occlusions."""
+        ttl = max(1, int(getattr(config, "VLM_INACTIVE_TRACK_TTL", 300)))
+        with self._lock:
+            for track_id, last_frame in list(self._last_seen.items()):
+                if current_frame_id - last_frame > ttl:
+                    self.cleanup_track(track_id)
+
+    def shutdown(self, timeout: float = 0.0) -> int:
+        """Stop submissions and drain for at most timeout seconds.
+
+        Running HTTP calls cannot be forcibly cancelled. After the deadline their
+        results are invalidated; SDK timeouts still bound the network operation.
+        Returns the number of requests that did not finish within the deadline.
+        reset() can reopen the analyzer for a later run.
+        """
+        with self._lock:
+            self._closed = True
+            pending = list(self._pending_futures.values())
+        if pending:
+            wait(pending, timeout=max(0.0, timeout))
+        with self._lock:
+            unfinished = sum(not f.done() for f in pending)
+            # Future completion wakes waiters before its callbacks necessarily
+            # finish. Preserve completed results before invalidating callbacks.
+            for track_id, future in self._pending_futures.items():
+                if future.done() and not future.cancelled():
+                    try:
+                        result = future.result()
+                        if result:
+                            self.activity_cache[track_id] = result
+                    except Exception:
+                        pass  # The completion callback reports worker errors.
+            self._generation += 1
+            self._pending_futures.clear()
+            self.frame_buffer.buffers.clear()
+            self._last_seen.clear()
+            for future in pending:
+                future.cancel()
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        return unfinished

@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -18,6 +18,9 @@ class VLMActivityAnalyzerTest(unittest.TestCase):
         analyzer._last_call_time = 0.0
         analyzer._backoff_until = 0.0
         analyzer._rate_limited_count = 0
+        analyzer._generation = 0
+        analyzer._closed = False
+        analyzer._last_seen = {}
 
     def setUp(self):
         self.analyzer = VLMActivityAnalyzer.__new__(VLMActivityAnalyzer)
@@ -187,6 +190,76 @@ class VLMActivityAnalyzerTest(unittest.TestCase):
         self.assertIsNotNone(self.analyzer.get_activity(1, 100 + ttl))
         self.assertIsNone(self.analyzer.get_activity(1, 100 + ttl + 1))
         self.assertIsNotNone(self.analyzer.get_activity(1), "no frame id => no expiry")
+
+    def test_disabled_mode_creates_no_client_or_executor(self):
+        with patch("config.USE_VLM", False), patch("openai.OpenAI") as client:
+            analyzer = VLMActivityAnalyzer()
+            analyzer.add_frame(1, np.zeros((10, 10, 3), np.uint8), 30)
+            self.assertIsNone(analyzer.analyze_if_ready(1, 30))
+            analyzer.reset()
+            self.assertEqual(analyzer.shutdown(), 0)
+            self.assertFalse(analyzer.enabled)
+            self.assertIsNone(analyzer._executor)
+            self.assertEqual(len(analyzer.frame_buffer.buffers), 0)
+            client.assert_not_called()
+
+    def test_old_callback_cannot_overwrite_new_run_or_pending_slot(self):
+        from vision.vlm_activity_analyzer import ActivityResult
+        a = self._throttle_analyzer(0)
+        a.frame_buffer = ActivityFrameBuffer()
+        old = Future()
+        old.set_running_or_notify_cancel()
+        a._pending_futures[1] = old
+        generation = a._generation
+        old.add_done_callback(lambda f: a._complete_analysis(1, 30, f, generation))
+        a.reset()
+        replacement = Future()
+        a._pending_futures[1] = replacement
+        old.set_result(ActivityResult(1, "walking", "old run", .9, "t", [30]))
+        self.assertNotIn(1, a.activity_cache)
+        self.assertIs(a._pending_futures[1], replacement)
+        a.shutdown()
+
+    def test_shutdown_is_bounded_and_ignores_late_results(self):
+        from vision.vlm_activity_analyzer import ActivityResult
+        a = self._throttle_analyzer(0)
+        pending = Future()
+        pending.set_running_or_notify_cancel()
+        a._pending_futures[1] = pending
+        generation = a._generation
+        pending.add_done_callback(lambda f: a._complete_analysis(1, 30, f, generation))
+        self.assertEqual(a.shutdown(timeout=0), 1)
+        self.assertIsNone(a.analyze_if_ready(1, 60))
+        pending.set_result(ActivityResult(1, "walking", "late", .9, "t", [30]))
+        self.assertEqual(a.activity_cache, {})
+        self.assertIsNone(a._executor)
+        a.reset()
+        self.assertFalse(a._closed)
+        self.assertIsNotNone(a._executor)
+        a.shutdown()
+
+    def test_throttle_does_not_prepare_samples(self):
+        a = self._throttle_analyzer(60)
+        a._last_call_time = time.monotonic()
+        a.analyze_if_ready(1, 30)
+        a.frame_buffer.get_sample_for_analysis.assert_not_called()
+        a.shutdown()
+
+    def test_inactive_cleanup_ignores_late_result(self):
+        from vision.vlm_activity_analyzer import ActivityResult
+        a = self._throttle_analyzer(0)
+        a.frame_buffer = ActivityFrameBuffer()
+        a.add_frame(1, np.zeros((10, 10, 3), np.uint8), 1)
+        old = Future()
+        old.set_running_or_notify_cancel()
+        a._pending_futures[1] = old
+        generation = a._generation
+        old.add_done_callback(lambda f: a._complete_analysis(1, 30, f, generation))
+        a.cleanup_inactive(10000)
+        old.set_result(ActivityResult(1, "walking", "expired", .9, "t", [30]))
+        self.assertNotIn(1, a.activity_cache)
+        self.assertNotIn(1, a.frame_buffer.buffers)
+        a.shutdown()
 
 
 if __name__ == "__main__":

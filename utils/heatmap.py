@@ -27,14 +27,16 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from collections import deque
+import config
+from typing import Dict, List, Tuple, Optional, Deque
 
 
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
 # positions store: {track_id: [(cx, cy, frame_num), ...]}
-PositionStore = Dict[int, List[Tuple[int, int, int]]]
+PositionStore = Dict[int, Deque[Tuple[int, int, int]]]
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +70,11 @@ def record_position(
     # portion of the frame. Box-centre tracks the actual person body location.
     cy = int((y1 + y2) / 2)
     if track_id not in store:
-        store[track_id] = []
+        limit = max(1, int(getattr(config, "HEATMAP_MAX_TRACKS", 256)))
+        if len(store) >= limit:
+            oldest = min(store, key=lambda tid: store[tid][-1][2] if store[tid] else -1)
+            del store[oldest]
+        store[track_id] = deque(maxlen=max(1, int(getattr(config, "HEATMAP_MAX_POINTS_PER_TRACK", 18000))))
     store[track_id].append((cx, cy, frame_id))
 
 

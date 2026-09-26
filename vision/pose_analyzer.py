@@ -34,7 +34,7 @@ def get_midas(model_type: str | None = None):
     """
     if model_type is None:
         model_type = config.DEPTH_MODEL_TYPE
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device(getattr(config, "VISION_DEVICE", "cpu"))
     key = (model_type, str(device))
 
     cached = _MIDAS_CACHE.get(key)
@@ -116,12 +116,15 @@ class PoseAnalyzer:
         # count — but a long live-camera run in Phase 2 would grow indefinitely.
         self.person_depth_filters = {}
         self.zone_depth_filters = {}
+        self._depth_stats_map = None
+        self._depth_stats_cache = {}
+        self._theft_reference_cache = {}
 
     def get_depth_map(self, frame):  # Converts a flat photo into a 3D map.
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         input_batch = self.depth_transform(img).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             prediction = self.depth_model(input_batch)
             prediction = torch.nn.functional.interpolate(
                 prediction.unsqueeze(1),
@@ -133,8 +136,42 @@ class PoseAnalyzer:
         depth_map = prediction.cpu().numpy()
         depth_min = depth_map.min()
         depth_max = depth_map.max()
-        normalized_depth = (depth_map - depth_min) / (depth_max - depth_min)
+        normalized_depth = (depth_map - depth_min) / max(float(depth_max - depth_min), 1e-8)
         return normalized_depth
+
+    def _zone_depth_statistics(self, depth_map, zone):
+        """Reuse raw ROI statistics until either the depth map or geometry changes.
+
+        Smoother updates remain at their original call sites/cadence.
+        """
+        if self._depth_stats_map is not depth_map:
+            self._depth_stats_map = depth_map
+            self._depth_stats_cache.clear()
+        geometry = (tuple(zone['coords']) if zone['type'] == 'restricted'
+                    else zone['polygon'].tobytes())
+        key = (id(zone), geometry)
+        if key not in self._depth_stats_cache:
+            h, w = depth_map.shape
+            if zone['type'] == 'restricted':
+                x1, y1, x2, y2 = zone['coords']
+                roi = depth_map[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            else:
+                mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(mask, [zone['polygon']], 255)
+                roi = depth_map[mask == 255]
+            if roi.size:
+                low, high = np.percentile(roi, [15, 85])
+                self._depth_stats_cache[key] = (np.median(roi), (high - low) / 2.0)
+            else:
+                self._depth_stats_cache[key] = None
+        return self._depth_stats_cache[key]
+
+    def cleanup_tracks(self, track_ids):
+        prefixes = tuple(f"{tid}_" for tid in track_ids)
+        if prefixes:
+            for key in list(self.person_depth_filters):
+                if key.startswith(prefixes):
+                    del self.person_depth_filters[key]
 
     # It checks if someone is reaching into a "3D Bubble" around an object.
     def check_trespassing(self, keypoints, bbox, zones, depth_map=None, person_id=None):  
@@ -155,27 +192,11 @@ class PoseAnalyzer:
             
             # 1. CALCULATE ZONE DEPTH
             if depth_map is not None:
-                h, w = depth_map.shape
-                
-                if z['type'] == 'restricted':
-                    zx1, zy1, zx2, zy2 = z['coords']
-                    safe_zx1, safe_zy1 = max(0, zx1), max(0, zy1)
-                    safe_zx2, safe_zy2 = min(w, zx2), min(h, zy2)
-                    zone_roi = depth_map[safe_zy1:safe_zy2, safe_zx1:safe_zx2]
-                else:
-                    # PASSIVE: Use a mask to get depth from the Polygon area
-                    mask = np.zeros((h, w), dtype=np.uint8)
-                    cv2.fillPoly(mask, [z['polygon']], 255)
-                    zone_roi = depth_map[mask == 255]
+                statistics = self._zone_depth_statistics(depth_map, z)
+                if statistics is None:
+                    continue
+                raw_obj_z, structural_spread = statistics
 
-                if zone_roi.size == 0: continue
-                
-                # Dynamic Depth Spread
-                obj_min_raw = np.percentile(zone_roi, 15)
-                obj_max_raw = np.percentile(zone_roi, 85)
-                structural_spread = (obj_max_raw - obj_min_raw) / 2.0
-                raw_obj_z = np.median(zone_roi)
-                
                 if zone_id not in self.zone_depth_filters:
                     self.zone_depth_filters[zone_id] = KalmanSmoother(process_noise=0.001, measurement_noise=0.1)
                 
@@ -323,27 +344,27 @@ class PoseAnalyzer:
         if width < 15 or height < 15: return False
 
         curr_gray = cv2.GaussianBlur(cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY), (3,3), 0)
-        ref_gray = cv2.resize(zone['reference_patch'], (width, height))
         curr_edges = cv2.Canny(curr_gray, 70, 200)
-        ref_edges = cv2.Canny(ref_gray, 70, 200)
-        
-        grid_h, grid_w = height // config.GRID_SIZE, width // config.GRID_SIZE
-        cells_showing_loss = 0
-        
-        for r in range(config.GRID_SIZE):
-            for c in range(config.GRID_SIZE):
-                cy, cx = r * grid_h, c * grid_w
-                c_cell = curr_edges[cy:cy+grid_h, cx:cx+grid_w]
-                r_cell = ref_edges[cy:cy+grid_h, cx:cx+grid_w]
-                
-                curr_density = np.count_nonzero(c_cell)
-                ref_density = np.count_nonzero(r_cell)
-                
-                if ref_density > 10: 
-                    loss_percent = (ref_density - curr_density) / ref_density * 100
-                    if loss_percent > config.THEFT_THRESHOLD:
-                        cells_showing_loss += 1
+        grid = config.GRID_SIZE
+        grid_h, grid_w = height // grid, width // grid
+        def densities(edges):
+            cells = edges[:grid_h * grid, :grid_w * grid].reshape(grid, grid_h, grid, grid_w)
+            return np.count_nonzero(cells, axis=(1, 3))
 
+        cached = self._theft_reference_cache.get(id(zone))
+        patch = zone['reference_patch']
+        if cached is None or cached[0] is not patch or cached[1:4] != (width, height, grid):
+            ref_gray = cv2.resize(patch, (width, height))
+            reference = densities(cv2.Canny(ref_gray, 70, 200))
+            cached = (patch, width, height, grid, reference)
+            self._theft_reference_cache[id(zone)] = cached
+        reference = cached[4]
+        current = densities(curr_edges)
+        valid = reference > 10
+        loss = np.zeros_like(reference, dtype=float)
+        np.divide(reference - current, reference, out=loss, where=valid)
+        loss *= 100.0
+        cells_showing_loss = np.count_nonzero(valid & (loss > config.THEFT_THRESHOLD))
 
         if cells_showing_loss >= 2:
             zone['missing_counter'] += 1
@@ -351,4 +372,3 @@ class PoseAnalyzer:
             zone['missing_counter'] = 0
             
         return zone['missing_counter'] > config.THEFT_FRAME_PERSISTENCE
-    

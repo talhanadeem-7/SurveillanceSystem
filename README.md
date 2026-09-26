@@ -4,6 +4,27 @@ A single-machine, offline-video surveillance analysis system. It ingests an uplo
 
 > **Scope note:** `app.py` is deliberately **not documented here** (excluded by request). It is a legacy OpenCV-window desktop variant of the same pipeline. `streamlit_app.py` is the maintained entry point. Where the two disagree, this document describes `streamlit_app.py`.
 
+## Current CPU configuration (September 2026)
+
+Run `venv311\Scripts\python.exe -m streamlit run streamlit_app.py` from the project root.
+Set `USE_VLM = False` in `config.py` for no VLM client, worker, image buffering, or API requests;
+set it to `True` for asynchronous activity recognition. Restart Streamlit after changing configuration.
+
+CPU inference uses an FP32 ONNX export of the same YOLOv8n-pose weights when available.
+After installing `requirements.txt`, run `venv311\Scripts\python.exe scripts/export_cpu_pose.py`
+to generate it. The export and checksum manifest live in `data/models/`; missing or mismatched
+exports fall back to PyTorch. Set `YOLO_CPU_BACKEND = "pytorch"` to force that fallback.
+Neither backend moves processing to CUDA. The RTX 3060 is not used by these CPU changes.
+
+The current defaults retain `FRAME_SKIP=2`, 640-width preprocessing, detection thresholds,
+FP32 precision, and per-frame OSNet ReID. Preview refresh is capped separately at 10 FPS.
+VLM completion has a three-second grace period and rejects late results from previous runs.
+Heatmap retention is capped at 256 tracks and 18,000 points per track; old history is evicted.
+Open the analyst or heatmap explicitly after surveillance to avoid eager background work.
+
+See [CPU performance validation](docs/CPU_PERFORMANCE.md) for current measurements, model
+selection, and live-camera limitations. The older measurements below describe earlier versions.
+
 ---
 
 ## Table of Contents

@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import time
 import datetime
+import copy
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 
@@ -19,7 +20,6 @@ from storage.event_logger import EventLogger
 from utils.video_utils import draw_surveillance_ui  # use the drawing logic
 from utils.csv_utils import LogAnalyzer
 
-from agents.reasoning_agent import SecurityAnalyst
 from utils.heatmap import (
     record_position,
     generate_heatmap,
@@ -56,6 +56,10 @@ def handle_video_upload():
                 f.write(uploaded_file.getbuffer())
             
             st.session_state.video_path = video_path
+            st.session_state.zones = []
+            st.session_state.processing_complete = False
+            st.session_state.track_positions = {}
+            st.session_state.identity_map = {}
             
             # Extract the first frame for Zone Setup
             cap = cv2.VideoCapture(video_path)
@@ -181,6 +185,7 @@ def define_zones_ui():
 def run_surveillance():
     #  It processes the video frame by frame.
     st.header("3. Live Surveillance")
+    run_started = time.perf_counter()
 
     if not st.session_state.zones:
         st.warning("Please define zones in 'Zone Setup' first.")
@@ -195,6 +200,16 @@ def run_surveillance():
         st.subheader("Live Status")
         status_text = st.empty()
 
+    activity_analyzer = ensure_activity_analyzer()
+    st.caption(f"VLM: {'enabled' if activity_analyzer.enabled else 'disabled'} | CPU vision")
+    st.session_state.processing_complete = False
+    st.session_state.track_positions = {}
+    st.session_state.final_activities = {}
+    if st.session_state.get("surveillance_runs", 0):
+        from vision.tracker import StrongSortTracker
+        st.session_state.detector.tracker = StrongSortTracker()
+    st.session_state.surveillance_runs = st.session_state.get("surveillance_runs", 0) + 1
+
     # --- INJECTING MEMORY SETUP ---
     (
         analyzer,
@@ -207,6 +222,8 @@ def run_surveillance():
         PERSISTENCE_THRESHOLD,
     ) = setup_surveillance_memory()
     identity_revalidation_state = {}
+    last_seen = {}
+    st.session_state.identity_map = identity_map
 
     # Reset IdentityGuardian so stale embeddings from a previous run
     # don't cause wrong matches in the new session.
@@ -236,23 +253,23 @@ def run_surveillance():
     # whose purpose is attributing events to specific people, that is the wrong
     # trade. See CLAUDE.md VF-38/VF-39.
     #
-    # Note also that cap.read() runs on EVERY source frame regardless of skipping,
-    # so FRAME_SKIP saves inference time but not decode time. Decode is a Phase 2
-    # reader-thread problem, not a FRAME_SKIP tuning problem.
-    FRAME_SKIP = 2
+    # grab() still advances the codec on every source frame. retrieve() runs only
+    # for analyzed frames, avoiding unnecessary color conversion/copies.
+    FRAME_SKIP = max(1, int(getattr(config, "FRAME_SKIP", 2)))
 
     # --- PERFORMANCE: downscale inference resolution ---
     # We detect at a smaller size and draw on the original frame.
-    # 640 wide is the YOLO native resolution anyway; going larger wastes GPU.
-    INFERENCE_WIDTH = 640
+    # Preserve the existing resize and model input size for accuracy parity.
+    INFERENCE_WIDTH = int(getattr(config, "INFERENCE_WIDTH", 640))
 
-    zones = st.session_state.zones
+    # Per-run counters and alignment must not mutate the saved zone definitions.
+    zones = copy.deepcopy(st.session_state.zones)
     frame_id = 0
     last_depth_map = None
-    DEPTH_REFRESH_INTERVAL = 5
+    DEPTH_REFRESH_INTERVAL = max(1, int(getattr(config, "DEPTH_REFRESH_INTERVAL", 5)))
 
     # Timing: keep display smooth at a capped rate
-    target_display_interval = 1.0 / min(native_fps / FRAME_SKIP, 30.0)
+    target_display_interval = 1.0 / max(1.0, min(native_fps / FRAME_SKIP, config.PREVIEW_FPS))
     last_display_time = 0.0
 
     # --- ROBUSTNESS: per-frame error handling -------------------------
@@ -263,18 +280,27 @@ def run_surveillance():
     consecutive_failures = 0
     total_failures = 0
     aborted_reason = None
+    processed_frames = 0
+    reached_eof = False
+    unfinished_vlm = 0
+    loop_started = time.perf_counter()
 
     try:
         while cap.isOpened() and not stop_btn:
             try:
-                ret, frame = cap.read()
-                if not ret:
+                # Advance the decoder on every source frame; convert/retrieve only
+                # the frames selected for analysis. No extra analysis frames lost.
+                if not cap.grab():
+                    reached_eof = True
                     break
                 frame_id += 1
 
                 # --- FRAME SKIP: forward-read to maintain real-time pace ---
                 if frame_id % FRAME_SKIP != 0:
                     continue
+                ret, frame = cap.retrieve()
+                if not ret:
+                    raise RuntimeError("Video frame retrieval failed")
 
                 # --- DOWNSCALE for inference, keep original for drawing ---
                 orig_h, orig_w = frame.shape[:2]
@@ -289,6 +315,8 @@ def run_surveillance():
 
                 # A. Align Zones (Homography)
                 zones = analyzer.align_zones(frame, zones)
+                restricted_zones = [z for z in zones if z["type"] == "restricted"]
+                passive_zones = [z for z in zones if z["type"] == "passive"]
 
                 # B. Run YOLO on the (possibly downscaled) inference frame.
                 results = st.session_state.detector.track_and_detect(infer_frame)
@@ -314,11 +342,13 @@ def run_surveillance():
                 # --- CONDITIONAL DEPTH ---
                 #  It checks if any person is visually overlapping a zone box in 2D.
                 # This block ensures we only turn on the "Depth Brain" (MiDaS) if someone is actually close to a zone. If everyone is far away, we skip this to save speed.
+                boxes_xyxy = (results.boxes.xyxy.cpu().numpy()
+                              if results.boxes is not None else np.empty((0, 4)))
                 depth_map = None
                 needs_depth = False
                 if results.boxes is not None:
                     for i in range(len(results.boxes)):
-                        bbox = results.boxes.xyxy[i].cpu().numpy()
+                        bbox = boxes_xyxy[i]
                         if analyzer.check_2d_overlap(bbox, zones):
                             needs_depth = True
                             break
@@ -346,7 +376,7 @@ def run_surveillance():
 
                     for i in range(len(results.boxes)):
                         current_id = ids[i]
-                        bbox = results.boxes.xyxy[i].cpu().numpy()
+                        bbox = boxes_xyxy[i]
                         kpts = results[i].keypoints
 
                         # Detections the tracker could not match carry a unique
@@ -359,6 +389,7 @@ def run_surveillance():
 
                         # --- HEATMAP: record foot position for this track ---
                         if not is_ephemeral:
+                            last_seen[current_id] = frame_id
                             record_position(
                                 st.session_state.track_positions,
                                 current_id,
@@ -395,7 +426,6 @@ def run_surveillance():
                         # --- A. DETERMINE CURRENT LOCATION (Passive Context) ---
                         #  It checks where the person is standing.
                         current_loc = "General Area" 
-                        passive_zones = [z for z in zones if z["type"] == "passive"]
 
                         if analyzer.check_trespassing(
                             kpts, bbox, passive_zones, depth_map, person_id=current_id
@@ -531,7 +561,7 @@ def run_surveillance():
                         raw_is_tres = analyzer.check_trespassing(
                             kpts,
                             bbox,
-                            [z for z in zones if z["type"] == "restricted"],
+                            restricted_zones,
                             depth_map,
                             person_id=current_id,
                         )
@@ -556,7 +586,7 @@ def run_surveillance():
                         person_statuses.append(confirmed_tres)
 
                         is_overlap = analyzer.check_2d_overlap(
-                            bbox, [z for z in zones if z["type"] == "restricted"]
+                            bbox, restricted_zones
                         )
                         if is_overlap:
                             anybody_overlapping_2d = True
@@ -650,16 +680,16 @@ def run_surveillance():
                                 )
 
                 # --- H. RENDERING AND UI UPDATES ---
-                draw_surveillance_ui(
-                    frame, results, zones, identity_map, activity_cache
-                )
-
+                for tid in list(activity_cache):
+                    if activity_analyzer.get_activity(tid, frame_id) is None:
+                        activity_cache.pop(tid, None)
                 # --- PERFORMANCE: throttle display — only push frame to browser
                 # at the target rate.  Heavy inference can run every loop tick,
                 # but st.image() is expensive; skipping a render never drops a frame
                 # from the analysis, just from the preview.
-                now = time.time()
+                now = time.perf_counter()
                 if now - last_display_time >= target_display_interval:
+                    draw_surveillance_ui(frame, results, zones, identity_map, activity_cache)
                     frame_placeholder.image(
                         cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
                         channels="RGB",
@@ -681,6 +711,8 @@ def run_surveillance():
                     
                     status_text.markdown(
                         f"**Frame:** {frame_id}\n\n"
+                        f"**Analyzed FPS:** {(processed_frames + 1) / max(now - loop_started, 1e-6):.1f}\n\n"
+                        f"**Source FPS:** {frame_id / max(now - loop_started, 1e-6):.1f} / {native_fps:.1f}\n\n"
                         f"**Known Identities:** {guardian_stats['known_identities']}\n\n"
                         f"**ID Corrections:** {guardian_stats['active_remaps']}\n\n"
                         f"**Retired IDs:** {guardian_stats['retired_ids']}\n\n"
@@ -692,6 +724,21 @@ def run_surveillance():
 
                 # Frame completed without raising -> reset the failure streak.
                 consecutive_failures = 0
+                processed_frames += 1
+                if processed_frames % 30 == 0:
+                    activity_analyzer.cleanup_inactive(frame_id)
+                    ttl = max(config.INACTIVE_TRACK_TTL, config.TRACKER_TRACK_BUFFER * FRAME_SKIP)
+                    expired = [tid for tid, seen in last_seen.items() if frame_id - seen > ttl]
+                    for tid in expired:
+                        for state in (last_seen, identity_map, unknown_check_counters,
+                                      face_candidate_state, identity_revalidation_state,
+                                      intrusion_persistence, person_location_state, activity_cache):
+                            state.pop(tid, None)
+                    analyzer.cleanup_tracks(expired)
+                    # Ephemeral detections never accumulate meaningful filter state.
+                    for key in list(analyzer.person_depth_filters):
+                        if key.startswith("-"):
+                            del analyzer.person_depth_filters[key]
 
                 if stop_btn:
                     break
@@ -720,7 +767,34 @@ def run_surveillance():
     finally:
         # Always runs: normal end, abort path, and user interruption.
         cap.release()
-        st.session_state.processing_complete = True
+        loop_seconds = time.perf_counter() - loop_started
+        unfinished_vlm = activity_analyzer.shutdown(
+            timeout=config.VLM_SHUTDOWN_TIMEOUT if reached_eof else 0.0
+        )
+        st.session_state.processing_complete = reached_eof and not aborted_reason
+        st.session_state.surveillance_metrics = {
+            "source_frames": frame_id, "processed_frames": processed_frames,
+            "processing_seconds": loop_seconds,
+            "elapsed_seconds": time.perf_counter() - run_started,
+            "processed_fps": processed_frames / max(loop_seconds, 1e-6),
+            "source_fps": frame_id / max(loop_seconds, 1e-6),
+            "frame_errors": total_failures, "unfinished_vlm": unfinished_vlm,
+        }
+        st.session_state.final_activities = {
+            tid: activity_analyzer.get_activity(tid, frame_id)
+            for tid in list(activity_analyzer.activity_cache)
+            if activity_analyzer.get_activity(tid, frame_id) is not None
+        }
+
+    metrics = st.session_state.surveillance_metrics
+    st.info(f"Processed {processed_frames} frames in {metrics['processing_seconds']:.2f}s "
+            f"({metrics['processed_fps']:.1f} analyzed FPS; {metrics['source_fps']:.1f} source FPS).")
+    if unfinished_vlm:
+        st.warning(f"{unfinished_vlm} VLM request(s) exceeded the shutdown grace period; late results were discarded.")
+    if st.session_state.final_activities:
+        st.write("Latest VLM observations (may precede the final frame):")
+        for tid, activity in st.session_state.final_activities.items():
+            st.text(f"Track {tid}: {activity.activity} ({activity.confidence:.2f})")
 
     # Zone alignment health: a camera that has drifted out of ORB match range
     # fails silently otherwise — the zones simply stop tracking the scene.
@@ -735,6 +809,8 @@ def run_surveillance():
 
     if aborted_reason:
         st.error(f"🛑 {aborted_reason}")
+    elif not reached_eof:
+        st.info("Surveillance stopped.")
     elif total_failures:
         st.warning(
             f"⚠️ Surveillance finished, but {total_failures} frame(s) were skipped "
@@ -756,6 +832,7 @@ def run_shelby_analyst():
     # 1. Initialize your existing SecurityAnalyst class
     if st.session_state.analyst is None:
         with st.spinner("Shelby is analyzing the logs..."):
+            from agents.reasoning_agent import SecurityAnalyst
             st.session_state.analyst = SecurityAnalyst()
         st.success("Shelby is ready!")
 
@@ -927,11 +1004,13 @@ def main():
                         st.session_state.processing_complete = True
                         st.rerun()
             else:
-                # Run the chat interface
-                run_shelby_analyst()
+                # Tabs execute eagerly: require an explicit action before loading RAG.
+                if st.session_state.get("analyst") is not None or st.button("Open Shelby Analyst"):
+                    run_shelby_analyst()
 
         with tab4:
-            run_heatmap_tab()
+            if st.checkbox("Show heatmap and trajectory", value=False):
+                run_heatmap_tab()
 
 
 
@@ -953,8 +1032,18 @@ def initialize_surveillance_components():
         with st.spinner("Initializing Face Recognition System..."):
             st.session_state.face_recognizer = FaceIdentifier()
 
-    if 'activity_analyzer' not in st.session_state:
-        st.session_state.activity_analyzer = VLMActivityAnalyzer()
+    ensure_activity_analyzer()
+
+def ensure_activity_analyzer():
+    enabled = bool(getattr(config, "USE_VLM", getattr(config, "VLM_ACTIVITY_ENABLED", True)))
+    current = st.session_state.get("activity_analyzer")
+    if current is None or current.enabled != enabled:
+        if current is not None:
+            current.shutdown(timeout=0.0)
+        current = VLMActivityAnalyzer(enabled=enabled)
+        st.session_state.activity_analyzer = current
+    return current
+
 
 def setup_surveillance_memory():
 

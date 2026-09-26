@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 import config
+from vision.cpu_runtime import fuse_osnet_for_inference
 
 
 logger = logging.getLogger(__name__)
@@ -85,13 +86,14 @@ class StrongSortTracker:
         device = (
             getattr(config, "TRACKER_DEVICE", None)
             or getattr(config, "STRONGSORT_DEVICE", None)
-            or ("cuda:0" if torch.cuda.is_available() else "cpu")
+            or "cpu"
         )
         fp16 = bool(
             getattr(config, "TRACKER_FP16", None)
             if getattr(config, "TRACKER_FP16", None) is not None
-            else getattr(config, "STRONGSORT_FP16", torch.cuda.is_available())
+            else getattr(config, "STRONGSORT_FP16", False)
         )
+        fp16 = bool(fp16 and str(device).startswith("cuda"))
         model_weights = _get_reid_weights()
 
         # BotSort constructor in boxmot 18.x
@@ -123,6 +125,11 @@ class StrongSortTracker:
                 device=device,
                 half=fp16,
             )
+
+        if getattr(config, "TRACKER_FUSE_OSNET", True) and str(device) == "cpu":
+            backend = getattr(self.tracker, "model", None)
+            count = fuse_osnet_for_inference(getattr(backend, "model", None))
+            logger.info("Fused %d OSNet Conv/BatchNorm pairs for CPU inference", count)
 
         # Minimum IoU to bind one of BotSort's emitted track boxes back to a
         # YOLO detection. Exposed for visibility only: measurement showed it

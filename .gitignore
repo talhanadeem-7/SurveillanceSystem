@@ -10,6 +10,8 @@ data/embeddings/
 data/authorized_faces/
 data/reid_snapshots/
 data/weights/
+# Generated CPU deployment exports; regenerate with scripts/export_cpu_pose.py.
+data/models/
 # Databases
 *.sqlite3
 *.pkl

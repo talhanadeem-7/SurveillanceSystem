@@ -8,6 +8,7 @@ from ultralytics.engine.results import Boxes
 import config
 from vision.tracker import StrongSortTracker
 from vision.identity_guardian import IdentityGuardian
+from vision.cpu_runtime import configure_cpu_runtime, cpu_pose_model_path, CPUPosePredictor
 
 
 class PoseDetector:
@@ -23,8 +24,10 @@ class PoseDetector:
     """
 
     def __init__(self):
-        self.model   = YOLO(config.MODEL_PATH)
+        configure_cpu_runtime()
+        self.model   = YOLO(cpu_pose_model_path(), task="pose")
         self.tracker = StrongSortTracker()
+        self._runtime_ready = False
 
         # Snapshot folder — sits next to config.py
         snapshot_root = getattr(
@@ -60,7 +63,14 @@ class PoseDetector:
             conf=config.CONFIDENCE_THRESHOLD,
             verbose=False,
             classes=[0],  # person only
+            device=getattr(config, "VISION_DEVICE", "cpu"),
+            half=False,
+            predictor=CPUPosePredictor,
         )
+        if not self._runtime_ready:
+            # Ultralytics resets PyTorch threads during its lazy backend setup.
+            configure_cpu_runtime()
+            self._runtime_ready = True
         result = results[0]
 
         if result.boxes is None or len(result.boxes) == 0:
@@ -105,11 +115,11 @@ class PoseDetector:
                 self._next_ephemeral_id -= 1
 
         # Step 4 — rebuild Ultralytics Boxes with corrected ids
-        valid_indices  = list(range(len(corrected_ids)))
-        tracked_result = result[valid_indices]
+        # Every detection is retained, so avoid slicing/copying the whole result.
+        tracked_result = result
 
         id_tensor = torch.as_tensor(
-            display_ids[valid_indices],
+            display_ids,
             device=tracked_result.boxes.xyxy.device,
             dtype=tracked_result.boxes.xyxy.dtype,
         ).unsqueeze(1)

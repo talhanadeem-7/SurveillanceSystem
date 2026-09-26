@@ -83,7 +83,7 @@ The VLM does **not** run per frame. A call happens only when **all** of these ho
 
 | # | Gate | Where | Condition |
 |---|---|---|---|
-| 1 | Master switch | `config.VLM_ACTIVITY_ENABLED` | must be `True` |
+| 1 | Master switch | `config.USE_VLM` | must be `True` |
 | 2 | Client built | `VLMActivityAnalyzer.__init__` | OpenAI client constructed successfully |
 | 3 | Not ephemeral | `streamlit_app.py` | `current_id >= 0` — unmatched detections get negative ids and accumulate no state |
 | 4 | Frame interval | `ActivityFrameBuffer.should_analyze` | `frames_since_last >= INTERVAL` **and** `frame_id % INTERVAL == 0` |
@@ -280,7 +280,7 @@ All keys live in [config.py](config.py) under `--- VLM ACTIVITY RECOGNITION ---`
 
 | Key | Default | Unit | What it does |
 |---|---|---|---|
-| `VLM_ACTIVITY_ENABLED` | `True` | bool | Master switch. `False` = zero overhead, no client built. |
+| `USE_VLM` | `True` | bool | Master switch. `False` = no client, worker, crop buffering, or API calls. |
 | `VLM_MODEL_NAME` | `"gpt-4o-mini"` | str | Must be a vision-capable OpenAI model. |
 | `VLM_ACTIVITY_ANALYSIS_INTERVAL` | `30` | **source frames** | Trigger cadence. ⚠️ frame-rate dependent — see [§2](#2-when-it-comes-into-play). |
 | `VLM_ACTIVITY_WINDOW_SIZE` | `30` | processed frames | Sliding window depth per track. |
@@ -635,7 +635,7 @@ The VLM must not make that worse, and it does not.
 ### "It costs too much"
 
 In order of impact: `detail="low"` (3×) → fewer `MAX_IMAGES` (linear) → longer floor (linear) →
-`VLM_ACTIVITY_ENABLED = False` (free).
+`USE_VLM = False` (free).
 **Do not** lower `MAX_IMAGE_SIDE` for cost — measured, it changes nothing at `detail="low"`.
 
 ### "Labels are wrong / vague"
@@ -691,7 +691,7 @@ Scripts used during debugging (not checked in — recreate in `scratchpad/` if n
 
 | Symptom | Likely cause | Check |
 |---|---|---|
-| No labels at all | `VLM_ACTIVITY_ENABLED = False`, or client failed to build | look for `VLMActivityAnalyzer initialized (enabled)` at startup |
+| No labels at all | `USE_VLM = False`, or client failed to build | look for `VLMActivityAnalyzer initialized (enabled)` at startup |
 | `openai.OpenAIError` on startup | **the key must be in `GOOGLE_API_KEY`** — `config.OPENAI_API_KEY = os.getenv("GOOGLE_API_KEY")` | `echo $GOOGLE_API_KEY` |
 | Labels only on some people | ephemeral tracks (negative ids) are skipped by design | normal |
 | Labels never update | check for 429 WARNINGs; check the floor | logs |
@@ -735,7 +735,7 @@ Scripts used during debugging (not checked in — recreate in `scratchpad/` if n
 
 ```python
 # Enable / disable
-config.VLM_ACTIVITY_ENABLED = True
+config.USE_VLM = True
 
 # The three cost levers, in order of impact
 config.VLM_ACTIVITY_IMAGE_DETAIL = "low"            # 3x cut
