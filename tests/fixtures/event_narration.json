@@ -1,8 +1,0 @@
-[
-  ["2026-09-27 10:30:00", "Person_4", "Identity", "Recognized as Alice", "General Area", "At 2026-09-27 10:30:00, Person_4 was Recognized as Alice."],
-  ["2026-09-27 10:30:01", "Person_4", "Intrusion", "UNAUTHORIZED", "General Area", "At 2026-09-27 10:30:01, Person_4 was detected intruding in the General Area."],
-  ["2026-09-27 10:30:02", "Person_4", "Intrusion", "UNAUTHORIZED", "Desk", "At 2026-09-27 10:30:02, Person_4 was detected intruding at the Desk."],
-  ["2026-09-27 10:30:03", "Alice", "Access", "AUTHORIZED", "Desk", "At 2026-09-27 10:30:03, Alice accessed the Desk."],
-  ["2026-09-27 10:30:04", "ASSET", "Theft", "STOLEN", "Desk", "At 2026-09-27 10:30:04, ASSET triggered Theft at the Desk."],
-  ["2026-09-27 10:30:05", "ASSET", "Removal", "BY_Alice", "General Area", "At 2026-09-27 10:30:05, ASSET triggered Removal in the General Area."]
-]
