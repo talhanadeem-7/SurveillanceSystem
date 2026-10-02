@@ -5,12 +5,12 @@ import config
 from agents.retriever import LogRetriever
 
 class SecurityAnalyst:
-    def __init__(self):
-        #  It starts the LogRetriever. This is the tool that searches through your CSV file to find relevant information (analyzed in retriever.py, if you have that).
+    def __init__(self, run_id=None):
+        #  It starts the LogRetriever. This is the tool that searches through stored database events to find relevant information (analyzed in retriever.py, if you have that).
         print("Initializing Security Analyst AI (OpenAI Version)...")
         
         # 1. Initialize the Retriever (The Knowledge Base)
-        self.retriever = LogRetriever()
+        self.retriever = LogRetriever(run_id=run_id)
         self.retriever.ingest_logs()
 
         # 2. Initialize the OpenAI LLM (The Brain)
@@ -43,6 +43,16 @@ class SecurityAnalyst:
             1. IDENTITY MAPPING: Mentally replace every instance of a Person ID (like Person_1) with their recognized name (like Talha) for the entire history.
             2. SPATIAL OVERRIDE: Specific zones (sofa, laptop, table) always take priority over the "General Area."
             3. STATE BLOCKS: Calculate durations for identical consecutive actions (e.g., "sat for five minutes").
+            4. ACTIVITY OBSERVATIONS: Logs also contain VLM-observed activities such as sitting,
+               walking, or bending, with timestamps, confidence and descriptions. Use these to
+               answer what a person was doing at a given time. A "From ... to ..." entry groups
+               repeated observations, not proof of uninterrupted behavior between samples.
+               Confidence expresses model uncertainty; do not turn an activity into evidence of
+               theft or authorization, or invent observations outside the recorded times.
+            5. CONFIGURED ALERTS: Rule alerts include their severity and rule name. These are
+               configurable conditions, not independent proof of a crime. Alert timestamps use
+               the user-entered recording start plus video time; other logs may use processing
+               timestamps. Do not assume these clocks match for an uploaded recording.
             SECURITY REASONING (Authorized vs. Theft):
             - AUTHORIZED: If a person is recognized by name (e.g., Talha) and interacts with an object, treat it as a safe and authorized action. Do not use the word "theft." Say they were "using" or "picking up their" item.
             - UNAUTHORIZED: If a person remains unidentified (e.g., Person_1) and takes an object or enters a restricted zone, treat this as an "Alerting Situation" and classify it as "Theft."

@@ -10,6 +10,7 @@ onnxruntime==1.25.0    # CPUExecutionProvider; no CUDA runtime required
 
 # Data & Logging
 pandas==2.3.3
+SQLAlchemy>=2.0,<3.0
 
 # AI & NLP (For the "Analyst" Phase)
 langchain==1.2.15

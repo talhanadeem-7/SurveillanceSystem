@@ -1,29 +1,30 @@
 # event_logger.py
 
-import csv
-import os
 import datetime
 import time
-import config
+from storage import StorageFatalError
 
 class EventLogger:
-    def __init__(self):
-        self.log_file = config.LOG_PATH
+    def __init__(self, repository=None, run_id=None):
+        self.repository = repository
+        self.run_id = run_id
+        self.frame_no = None
         self.active_events = {}
         self.cooldown_seconds = 3.0
-        self._initialize_log_file()
+        self.person_ids = {}
 
-    def _initialize_log_file(self):
-        # The File Creator.
-        """
-        Creates the CSV file with headers if it is missing OR empty.
-        """
-        file_exists = os.path.exists(self.log_file)
-        if not file_exists or os.stat(self.log_file).st_size == 0:
-            os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-            with open(self.log_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Entity", "Action", "Status", "Location"])
+    def bind_run(self, repository, run_id):
+        self.repository = repository
+        self.run_id = run_id
+        self.active_events.clear()
+        self.person_ids.clear()
+
+    def observe_person(self, track_id, display_name, is_enrolled=False):
+        person_id = self.repository.upsert_person(
+            self.run_id, track_id, display_name, is_enrolled)
+        self.person_ids[f"Person_{track_id}"] = person_id
+        self.person_ids[display_name] = person_id
+        return person_id
 
     def log_event(self, entity_id, event_type, status, is_active, location="General Area"):
         # The Gatekeeper.. LOgs event
@@ -37,9 +38,8 @@ class EventLogger:
 
         if is_active:
             if event_key not in self.active_events:
-                self._write_to_csv_and_terminal(entity_id, event_type, status, location)
+                self.write_event(entity_id, event_type, status, location)
             self.active_events[event_key] = current_time
-        pass
 
     def update_logs(self):
         current_time = time.time()
@@ -50,7 +50,7 @@ class EventLogger:
         for key in keys_to_remove:
             del self.active_events[key]
 
-    def _write_to_csv_and_terminal(self, entity_id, event_type, status, location):
+    def write_event(self, entity_id, event_type, status, location):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         message = ""
@@ -67,6 +67,13 @@ class EventLogger:
 
         print(f"[{timestamp}] {message}")
 
-        with open(self.log_file, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, entity_id, event_type, status, location])
+        if self.repository is None or self.run_id is None:
+            raise StorageFatalError("No active database run is bound to the event logger")
+        self.repository.log_event(
+            self.run_id, event_type, status, entity_id, location,
+            person_id=self.person_ids.get(entity_id),
+            timestamp=timestamp, frame_no=self.frame_no,
+        )
+
+    # Compatibility for the out-of-scope desktop entry point; never writes CSV.
+    _write_to_csv_and_terminal = write_event

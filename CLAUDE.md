@@ -15,9 +15,9 @@ uploads a recorded clip through a Streamlit UI, draws restricted (rectangle) and
 boxmot BotSort assigns track IDs → an in-house `IdentityGuardian` optionally corrects ID
 switches by appearance → DeepFace/ArcFace matches faces against enrolled photos → a
 2D+MiDaS-depth test decides zone intrusion → an edge-density test decides object removal
-("theft"). Every decision is appended to `storage/event_logs.csv`, which is the **only**
+("theft"). Every decision is stored in SQLite through `storage/repository.py`, the persistence
 interface to the second half of the system: a LangChain RAG agent ("Shelby Analyst") that
-embeds those log rows into Chroma and answers natural-language questions with `gpt-4o-mini`.
+embeds event and activity narration into Chroma and answers natural-language questions with `gpt-4o-mini`.
 It is not a live-camera system, has no authentication, and has no database server.
 
 **Entry point:** `streamlit run streamlit_app.py` (run from the project root — `config.MODEL_PATH`
@@ -141,7 +141,7 @@ Ranked by priority.
 |---|---|---|---|
 | 1 | **OQ-9** | **Split-intrusion attribution defect** -- a confirmed intrusion split across two `Person_<id>` rows. | **Corrupted record, not a missed detection.** The CSV is the seam to the analyst, which will narrate one event as two people, confidently and wrongly. Mitigation is cheap and needs no gallery. |
 | 2 | **OQ-17** | `align_zones` accepts a successful-but-absurd homography. | Real correctness bug; **dormant only because alignment is now off by default**. Must be fixed before alignment is ever re-enabled. |
-| 3 | **OQ-14** | Storage layer needs a distinguishable fatal error. | A locked file or dropped connection currently masquerades as 30 bad frames. Belongs in the DB migration. |
+| 3 | **OQ-14 resolved** | Storage failures abort immediately. | Measured read-only failure and lock recovery; see VF-45. |
 | 4 | **OQ-16** | Run ORB on the downscaled frame. | Highest-value untested optimisation, but demoted by the alignment default change -- only matters if alignment returns. |
 | 5 | OQ-6 | Long-gap ReID gallery (OSNet-based). | Deferred to Phase 6; K=0 on target footage, but the face half of the risk is unmeasured (VF-28). |
 | 6 | OQ-12 | Why OSNet failed to re-associate at 21 updates when it recovered at 30. | Cheaper and more tractable lead than the gallery. |
@@ -627,26 +627,18 @@ Established by measurement. Evidence in one line each.
   just report ms/call. Deliberately **not implemented** in Task 3, which was closed on its
   specified scope.
 
-- **OQ-14 — The storage layer needs its own fatal-error branch; it does NOT go away with the CSV.**
-  Task 4 treats every per-frame exception as skippable. A storage failure is not: if writing an
-  event fails, it fails on **every** frame that logs an event, so the run burns 30 frames and then
-  aborts with a message that looks like a detection failure. Today that is
-  `PermissionError`/`OSError` on `storage/event_logs.csv` (e.g. the file open in Excel).
-  **A database does not fix this** — a locked SQLite file, an exhausted connection pool or a
-  dropped connection produces exactly the same pattern. **When the CSV is replaced by a database,
-  the storage layer must raise a distinguishable fatal error that `run_surveillance` aborts on
-  immediately, rather than letting it masquerade as 30 bad frames.** Deliberately not implemented
-  as a CSV-specific branch, which would be dead code after the migration.
+- **OQ-14 - RESOLVED (2026-09-26, VF-45).** Repository failures raise
+  `StorageFatalError`; the real pipeline catches this before its generic frame handler.
+  A read-only SQLite write aborted after one detector call, with zero frame failures,
+  a storage-specific UI error, and persisted `runs.status = aborted`. Persistent-lock
+  finalization uses a local recovery record; it cannot update an unwritable database
+  until access returns. Actual lock/recovery and read-only tests cover both cases.
 
-- **OQ-15 — `processing_complete` cannot distinguish "finished" from "stopped".** The Task 4
-  `finally` sets `processing_complete = True` on **every** exit path. Two consequences, both
-  currently invisible in the UI:
-  1. **Ctrl+C / KeyboardInterrupt** — an interrupted run presents the Analyst tab as ready.
-  2. **The 30-consecutive-failure abort** — an aborted run also looks complete. (An `st.error`
-     is shown, but the state flag says otherwise, and the flag is what the UI gates on.)
-  Fix: a separate `run_completed` flag distinct from `processing_complete`, so the UI can tell
-  "the loop stopped" from "the video finished". Not implemented — the flag semantics are a UI
-  decision, and `processing_complete` is also read by the Analyst tab's existing-logs path.
+- **OQ-15 - Run outcome can now be read from `runs.status`.** The database records
+  completed, aborted, or interrupted, with frame counters and end time. Current
+  `processing_complete` retains the EOF-only behavior introduced by the CPU work.
+  A richer Analyst/history UI can now distinguish outcomes using the persisted status;
+  that UI work is deferred. The historical Task 4 always-True behavior is superseded.
 
 - **OQ-13 — Enrol someone who actually appears in `office cctv.mp4`, then re-run the re-entry
   study.** This is the single concrete step that would make **M meaningful for the first time**
@@ -774,11 +766,9 @@ Established by measurement. Evidence in one line each.
 - ⚠️ **`VLM_ACTIVITY_ANALYSIS_INTERVAL` is in SOURCE frames, so its real-time meaning depends on
   clip frame rate.** The config comment says "~2 seconds at FRAME_SKIP=2", which assumes 30 fps
   source. On this 60 fps clip the same value is **0.5 s**. Not fixed; flagged.
-- **VLM activity results are never persisted.** `storage/activity_observer.py` (`ActivityObserver`)
-  exists and is documented in `VLM.md`, but **nothing imports it**. `VLMActivityAnalyzer` output
-  goes only into the in-memory `activity_cache`, which is drawn on the frame and shown in the
-  sidebar, then discarded at end of run. `storage/activity_observations.csv` is therefore never
-  written, and activity never reaches the RAG analyst. See the action-recognizer cleanup note below.
+- **VLM persistence and Analyst integration are wired.** Observations are saved through
+  `ActivityObserver` (VF-50). `LogAnalyzer` now narrates confidence-filtered activity
+  spans alongside security events for Chroma ingestion (VF-51).
 
 **action_recognizer removal (2026-09-01)** — `vision/action_recognizer.py` itself was already
 deleted in commit `760a6c2`; the residue it left behind has now been removed:
@@ -869,3 +859,214 @@ This update supersedes earlier CPU throughput/configuration notes above. See
   responsive independent stop control remain work for deployment.
 - Test scripts/logs/crops/JSON folders were removed after validation. Generated
   ONNX deployment weights and manifest remain in data/models (Git-ignored).
+
+## SQLite storage migration - 2026-09-26
+
+### Audit before implementation
+
+Production references, excluding virtual environments and the legacy `app.py`:
+
+- `config.LOG_PATH` named `storage/event_logs.csv`.
+- `storage/event_logger.py`: created the header and appended event rows;
+  `log_event()` called its writer after the existing debounce check.
+- `streamlit_app.py`: two direct identity-writer calls, six `log_event()` call
+  sites for zone/asset events, and an existence check to offer existing logs.
+- `utils/csv_utils.py`: `LogAnalyzer.load_data()` used `pandas.read_csv()`.
+  `agents/retriever.py` consumed `get_all_logs_formatted()` and wrapped each
+  narration string in one LangChain Document for Chroma. `reasoning_agent.py`
+  reached these documents through the retriever.
+- `storage/activity_observer.py`: created/appended its separate CSV, but had
+  no caller in the pipeline. No production reader or writer referenced
+  `video_metadata.csv`; the file was zero bytes with no header.
+- Actual event columns: `Timestamp,Entity,Action,Status,Location`. Actual activity
+  columns: `Timestamp,Track_ID,Activity_Label,Description,Confidence,Frame_ID`.
+  Event data had 338 rows; activity and metadata data had zero rows.
+
+### Implementation and operation
+
+`storage/db.py` owns SQLAlchemy schema/engine setup; `storage/repository.py`
+owns all data access. SQLAlchemy imports are confined to those modules.
+`DATABASE_URL` defaults to `sqlite:///storage/shelby.db`. SQLAlchemy 2.x is the
+only added dependency. SQLite connection setup enables WAL and foreign keys;
+data operations use portable SQLAlchemy expressions. PostgreSQL execution was
+not tested; deployment there also requires its DBAPI driver.
+
+Tables: `cameras`, `runs`, `zones`, `persons`, `events`, `activity_observations`,
+plus historical `csv_imports` receipts retained in the existing database.
+Fresh databases no longer create the retired import-receipt table. Run status has a database constraint;
+person track IDs are unique within a run. Events index `(run_id, timestamp)`
+and `action`. Event details retain original entity/location text independently
+of later person display-name changes. Zone geometry excludes image patches.
+Runs also carry JSON metadata so unspecified legacy metadata can be retained.
+
+Uploaded videos register cameras; executions create separate runs. Events and
+VLM observations commit at their frame boundary. Person-only updates commit
+every 30 source frames; finalization flushes remaining work. The observer
+deduplicates polled VLM results and saves final drained results. `frames_skipped`
+counts failed analysis frames, not deliberate FRAME_SKIP downsampling.
+
+`LogAnalyzer(run_id=...)`, `LogRetriever(run_id=...)`, and
+`SecurityAnalyst(run_id=...)` optionally restrict analysis to a run. Their default
+remains all events. Run-specific Chroma stores are separate from the all-run store.
+Runtime production code no longer reads CSVs. The later cleanup removed
+`LOG_PATH`, renamed the analyst utility to `utils/log_analyzer.py`, and retired the importer. `app.py`, all vision modules, thresholds and models were
+unchanged. No API layer was added. Heatmap positions remain in session state.
+
+Run verification from the project root (the completed importer was retired during cleanup):
+
+```powershell
+.\venv311\Scripts\python.exe -m unittest discover -s tests -v
+.\venv311\Scripts\python.exe scripts/verify_storage_pipeline.py --label check
+```
+
+The completed migration preserved legitimate duplicate rows, committed each file
+atomically with its receipt, and refused to re-import a changed previously imported
+file. The source CSVs were subsequently deleted at the user's request after exact verification. Legacy rows have no video provenance, so they belong to explicitly labelled
+legacy runs with unknown completion (`interrupted`), not invented video matches.
+
+### Measured results
+
+- **VF-44 - Migration and narration preserved exactly.** Actual migration imported
+  **338** events: Intrusion **199**, Identity **75**, Access **41**, Theft **18**,
+  Removal **5**. A second invocation imported **0**. All **338** narration strings
+  were byte-for-byte identical to the pre-change formatter output, not merely a
+  sampled semantic comparison. Example before and after:
+  `At 2026-07-15 21:37:15, Person_1 was detected intruding at the Laptop.`
+- **VF-45 - Fatal storage errors abort immediately; lifecycle is tested.**
+  `tests/test_storage.py` executes the shipped `run_surveillance()` AST with UI
+  and vision dependencies stubbed. An actual SQLite read-only write failed on
+  the first detector call: **0** frame errors, storage-specific UI error,
+  `processing_complete=False`, and `runs.status=aborted`. Restoring write access
+  after that failure allowed terminal status persistence. A separate actual
+  write-lock test verified rollback, pending status recovery after unlocking,
+  and no persisted failed event. Completed, user-stop, KeyboardInterrupt, and
+  exactly 30 ordinary frame-failure paths were also tested. Final full suite:
+  **36 tests passed**, including **14** storage tests and all **22** existing tests.
+- **VF-46 - Full office pipeline storage comparison.** Real detection, tracking,
+  depth, face matching, zone handling and preview preparation ran through
+  `run_surveillance()`; Streamlit rendering was stubbed and VLM disabled equally.
+  Both runs analyzed **739 / 1479** source frames without frame errors.
+
+  | Storage | Loop seconds | Analyzed FPS | Change from CSV |
+  |---|---:|---:|---:|
+  | CSV baseline | 52.4128 | 14.0996 | baseline |
+  | Initial every-frame DB commit | 54.9296 | 13.4536 | -4.582% |
+  | Final event/frame + person batching | 54.0301 | 13.6776 | **-2.9933%** |
+
+  The final result narrowly meets the requested 3% bound. These are individual
+  local runs, not confidence intervals; browser transport and live VLM were not
+  benchmarked. Evidence JSON/logs remain under the local ignored `scratchpad/`.
+- **VF-47 - Tracking regression retained after migration.** The historical
+  `scratchpad/regression.py` was absent in this checkout. The retained
+  `scripts/verify_storage_pipeline.py` therefore measures the real pipeline and
+  asserts the recorded reference counts/lifetimes without changing vision code.
+
+  | Clip | Detections | Ephemeral | Tracks | Integer median track life |
+  |---|---:|---:|---:|---:|
+  | office cctv | 1050 | 29 | 6 | 147 |
+  | crowd sample | 787 | 117 | 27 | 23 |
+  | crowded sample2 | 2502 | 124 | 43 | 40 |
+
+  Office before/after counts and every track's first/last frame and lifetime
+  matched exactly. Track 4 still ends at **429** and track 6 starts at **450**;
+  the required split across **430-448** is preserved. Both crowd assertions also
+  passed with no UI errors. Use `--clip "crowd sample.mp4"` or
+  `--clip "crowded sample2.mp4"` to reproduce those checks.
+
+### Limitations and follow-up
+
+OQ-14 is resolved as measured above. An unwritable database cannot itself store
+`aborted`: if finalization remains blocked, a per-database JSON recovery record
+is written under `storage/pending_runs/`, then applied by the next repository
+opening after access returns. If even that filesystem is full/unwritable, the
+status cannot be guaranteed durable and the UI reports failure. This is not a
+claim that a locked/read-only database was updated while still unwritable.
+
+OQ-15's richer UI can now use `runs.status`; heatmap persistence remains deferred.
+The initial migration left CSVs untouched; the later cleanup removed them after
+verification. This verification did not invoke paid embedding/chat
+or VLM APIs, so live Chroma ingestion and live activity API behavior were not
+retested; event narration and the database observer were tested locally.
+
+## CSV retirement and persistence audit - 2026-09-26
+
+At the user's explicit request, removed all three legacy storage CSVs and the
+temporary baseline CSV, retired `scripts/migrate_csv_to_db.py` and its receipt
+helpers/model and migration-only tests, removed unused `LOG_PATH`, and renamed
+`utils/csv_utils.py` to `utils/log_analyzer.py` with all active imports updated.
+Historical import receipt rows remain in the existing database as audit data.
+The legacy `_write_to_csv_and_terminal` alias remains solely because untouched
+`app.py` calls it; it delegates to the database writer and performs no CSV I/O.
+
+- **VF-48 - Source data safe to retire.** Before deletion, all **338** source rows
+  matched the database's preserved legacy rows exactly; all three import-receipt
+  hashes matched their source files. A SQLite backup was saved at the local ignored
+  `scratchpad/pre_csv_cleanup.db`. After cleanup, every row of every existing table
+  matched that backup, SQLite integrity returned `ok`, and foreign-key checks
+  returned zero violations. All **338** narration documents still matched the
+  original baseline without any CSV files present.
+- **VF-49 - New-run persistence verified by readback.** A fresh real office-video
+  execution in isolated `scratchpad/cleanup_verified.db` persisted **1 completed
+  run, 1 zone, 6 persons, and 10 events**. Every emitted event's entity/action/status/
+  location matched its stored record in order. Camera, person and zone links,
+  rectangle geometry, frame numbers and run counters passed assertions. The video
+  retained **1050 detections / 29 ephemeral / 6 tracks**, with no frame errors.
+  VLM was disabled for this real-video check, so it produced **0 activities**.
+- **VF-50 - Field and activity persistence tests.** Final suite: **37 passed**
+  (**15 storage**, **22 existing**). Reopening a separate test database preserved
+  camera/run fields, rectangle/polygon geometry, enrolled person identity and
+  timestamps, all five event types, details, snapshot-path values, activity label,
+  description, confidence, timestamps and sampled frame IDs. Pipeline tests also
+  saved activity results received during shutdown and for a no-longer-detected
+  track before inactive cleanup removed its cache entry. The latter revealed a
+  potential gap in the original integration; completed activities are now collected
+  at every frame boundary, independent of current detections. These activity tests
+  use synthetic VLM results and make no paid API requests.
+
+The main database still contains historical migration data only: **1 camera,
+1 legacy run, 35 persons, 338 events**, and no zones or activity observations.
+Historical CSVs supplied no zone geometry or activity rows; those cannot be
+reconstructed. Verification data was kept out of the main database. Heatmap and
+trajectory positions still live in session state, as previously deferred.
+
+Database reset (2026-09-26, explicitly requested): cleared all rows from the configured storage/shelby.db in one transaction, including historical import receipts. Verified all seven tables contain zero rows; schema retained. The historical counts above describe the pre-reset verification. Local scratchpad verification databases and backup were not part of this reset.
+
+## Analyst activity narration - 2026-09-27
+
+`Repository.get_activities(run_id=None)` now returns observations in timestamp/ID
+order with the linked person's current display name. `LogAnalyzer` merges security
+events and activity documents by timestamp (collapsed spans use their start time).
+Event sentences retain their existing format. Activities use the known display
+name or `Person_<track_id>`, label, confidence and description.
+
+`VLM_ACTIVITY_MIN_LOG_CONFIDENCE = 0.5` is an Analyst-only filter: stored rows and
+vision decisions are unchanged. Consecutive identical labels are collapsed within
+each `(run_id, track_id)` into a From/To document, with minimum confidence and
+distinct descriptions retained in observation order. A changed label or a
+below-floor observation breaks the span; other tracks and security events do not.
+No collapse crosses runs. Spans describe sampled observations, not proof of
+continuous behavior. The Analyst prompt explains this and the uncertainty of VLM
+observations. Existing optional run filtering flows through `SecurityAnalyst`,
+`LogRetriever`, and `LogAnalyzer`. Existing Analyst sessions must be reopened or
+their retriever re-ingested to rebuild an already-created event-only Chroma index.
+
+- **VF-51 - Activities reach Analyst ingestion, with event text preserved.**
+  Measured by **7** new synthetic database tests: known/fallback names and exact
+  narration, timestamp ordering including out-of-order inserts, configurable
+  inclusive confidence floor, low-confidence span boundaries, per-track collapsing
+  and label changes, run isolation, and the real Analyst/retriever construction
+  path with embeddings/chat/Chroma mocked. Captured Chroma documents contained
+  exactly the selected run's activity narration. No paid API calls were made.
+  Event-only output matched all **6** stored fixture sentences byte-for-byte,
+  covering all five event types and both location prepositions.
+  Full unit suite: **44 tests passed** (log: local ignored
+  `scratchpad/activity_rag_all_tests.log`).
+- **VF-52 - Pipeline regression still passes after Analyst integration.**
+  `scripts/verify_storage_pipeline.py --label activity_rag_verified` exited **0**:
+  office video **739** analyzed frames, **1050** detections, **29** ephemeral,
+  **6** tracks; track 4 ends at **429**, track 6 starts at **450**. Isolated database
+  readback verified **1 completed run, 1 zone, 6 persons, 10 events**, with every
+  emitted event matching storage and no frame/UI errors. This real-video check
+  disabled VLM, so activity ingestion is covered by the synthetic tests above,
+  not a live paid VLM/embedding/chat run. `app.py`, vision code and existing vision
+  thresholds were unchanged.

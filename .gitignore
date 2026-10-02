@@ -1,7 +1,10 @@
 .venv/
+venv/
 venv311/
 __pycache__/
 .env
+.env.*
+!.env.example
 # ML models
 *.pt
 # Data & generated files
@@ -13,8 +16,21 @@ data/weights/
 # Generated CPU deployment exports; regenerate with scripts/export_cpu_pose.py.
 data/models/
 # Databases
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite-*
+*.sqlite.*
 *.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+*.sql
+*.dump
 *.pkl
+storage/*.csv
+storage/pending_runs/
+scratchpad/
 .vscode/FYP_Proposal_extracted.txt
 
 .vscode/

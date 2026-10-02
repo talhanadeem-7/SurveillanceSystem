@@ -17,8 +17,13 @@ from vision.face_recognition import FaceIdentifier
 from vision.vlm_activity_analyzer import VLMActivityAnalyzer
 
 from storage.event_logger import EventLogger
+from storage.repository import Repository
+from storage.activity_observer import ActivityObserver
+from storage import StorageFatalError
+from alerts.rules_engine import RulesEngine, FrameState, TrackState, resolve_rules
+from alerts.ui import alert_rules_tab, recording_start_input
 from utils.video_utils import draw_surveillance_ui  # use the drawing logic
-from utils.csv_utils import LogAnalyzer
+from utils.log_analyzer import LogAnalyzer
 
 from utils.heatmap import (
     record_position,
@@ -55,6 +60,12 @@ def handle_video_upload():
             with open(video_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
+            try:
+                with Repository() as repository:
+                    repository.ensure_camera(video_path, uploaded_file.name)
+            except StorageFatalError as exc:
+                st.error(f"Fatal storage error: upload registration failed: {exc}")
+                return st.session_state.video_path
             st.session_state.video_path = video_path
             st.session_state.zones = []
             st.session_state.processing_complete = False
@@ -186,6 +197,9 @@ def run_surveillance():
     #  It processes the video frame by frame.
     st.header("3. Live Surveillance")
     run_started = time.perf_counter()
+    recording_start = st.session_state.get("recording_start_time") or datetime.datetime.now()
+    live_alerts = []
+    alerts_placeholder = st.empty()
 
     if not st.session_state.zones:
         st.warning("Please define zones in 'Zone Setup' first.")
@@ -285,7 +299,26 @@ def run_surveillance():
     unfinished_vlm = 0
     loop_started = time.perf_counter()
 
+    repository = None
+    run_id = None
+    activity_observer = None
+    interrupted = False
     try:
+        repository = Repository()
+        run_id = repository.start_run(os.path.basename(st.session_state.video_path),
+                                      source=st.session_state.video_path,
+                                      metadata={"recording_start_time": recording_start.isoformat(),
+                                                "source_fps": native_fps})
+        st.session_state.run_id = run_id
+        repository.save_zones(run_id, zones)
+        configured_rules, rule_warnings = resolve_rules(
+            repository.get_rules(enabled_only=True), repository.get_zones(run_id))
+        for warning in rule_warnings:
+            st.warning(warning)
+        rules_engine = RulesEngine(configured_rules, native_fps, recording_start)
+        repository.flush()
+        st.session_state.logger.bind_run(repository, run_id)
+        activity_observer = ActivityObserver(repository, run_id)
         while cap.isOpened() and not stop_btn:
             try:
                 # Advance the decoder on every source frame; convert/retrieve only
@@ -298,6 +331,7 @@ def run_surveillance():
                 # --- FRAME SKIP: forward-read to maintain real-time pace ---
                 if frame_id % FRAME_SKIP != 0:
                     continue
+                st.session_state.logger.frame_no = frame_id
                 ret, frame = cap.retrieve()
                 if not ret:
                     raise RuntimeError("Video frame retrieval failed")
@@ -367,6 +401,7 @@ def run_surveillance():
                     if z["type"] == "restricted":
                         z["status"], z["color"] = "SECURE", config.COLOR_SECURE
 
+                rule_tracks = []
                 person_statuses = []
                 anybody_overlapping_2d = False
 
@@ -389,6 +424,9 @@ def run_surveillance():
 
                         # --- HEATMAP: record foot position for this track ---
                         if not is_ephemeral:
+                            st.session_state.logger.observe_person(
+                                current_id, identity_map.get(current_id, f"Person_{current_id}"),
+                                current_id in identity_map)
                             last_seen[current_id] = frame_id
                             record_position(
                                 st.session_state.track_positions,
@@ -506,7 +544,7 @@ def run_surveillance():
                                         identity_revalidation_state[current_id]["fails"] = 0
                                         display_name = f"Person_{current_id}"
                                         is_authorized = False
-                                        st.session_state.logger._write_to_csv_and_terminal(
+                                        st.session_state.logger.write_event(
                                             f"Person_{current_id}",
                                             "Identity",
                                             f"Revoked {mapped_name} (mismatch)",
@@ -543,7 +581,7 @@ def run_surveillance():
                                             display_name = found_name
                                             is_authorized = True
 
-                                            st.session_state.logger._write_to_csv_and_terminal(
+                                            st.session_state.logger.write_event(
                                                 f"Person_{current_id}",
                                                 "Identity",
                                                 f"Recognized as {found_name}",
@@ -554,6 +592,8 @@ def run_surveillance():
                                         candidate["count"] = 0
 
                         if not is_ephemeral:
+                            st.session_state.logger.observe_person(
+                                current_id, display_name, is_authorized)
                             unknown_check_counters[current_id] += 1
                             person_location_state[current_id] = current_loc
 
@@ -593,12 +633,21 @@ def run_surveillance():
 
                         # --- F. ZONE-SPECIFIC LOGIC ---
                         # If an unauthorized person touches a Restricted Zone for a few frames, it triggers an "Intrusion" alert.
+                        rule_memberships = set()
+                        if configured_rules and not is_ephemeral:
+                            foot = (float((kpts.xy[0][15][0] + kpts.xy[0][16][0]) / 2),
+                                    float((kpts.xy[0][15][1] + kpts.xy[0][16][1]) / 2))
+                            for passive_zone in passive_zones:
+                                if cv2.pointPolygonTest(passive_zone["polygon"], foot, False) >= 0:
+                                    rule_memberships.add(passive_zone["name"])
                         for z in zones:
                             if z["type"] == "restricted":
                                 this_zone_tres = analyzer.check_trespassing(
                                     kpts, bbox, [z], depth_map, person_id=current_id
                                 )
 
+                                if configured_rules and this_zone_tres and not is_ephemeral:
+                                    rule_memberships.add(z["name"])
                                 if this_zone_tres and confirmed_tres:
                                     z["last_interactor"] = display_name
                                     person_location_state[current_id] = z["name"]
@@ -623,6 +672,14 @@ def run_surveillance():
                                             True,
                                             location=z["name"],
                                         )
+
+                        if configured_rules and not is_ephemeral:
+                            rule_activity = activity_analyzer.get_activity(current_id, frame_id)
+                            rule_tracks.append(TrackState(
+                                int(current_id), display_name, is_authorized,
+                                frozenset(rule_memberships),
+                                rule_activity.activity if rule_activity else None,
+                                rule_activity.confidence if rule_activity else 0.0))
 
                     results.is_trespassing = person_statuses
 
@@ -721,6 +778,23 @@ def run_surveillance():
                     last_display_time = now
 
                 st.session_state.logger.update_logs()
+                # A VLM result may arrive after its person leaves the current
+                # frame. Persist completed results before inactive-track cleanup.
+                activity_observer.log_activities(list(activity_analyzer.activity_cache.values()))
+                new_alerts = rules_engine.update(FrameState(frame_id, tuple(rule_tracks)))
+                for alert in new_alerts:
+                    person_id = st.session_state.logger.person_ids.get(f"Person_{alert.track_id}")
+                    repository.log_alert(run_id, alert, person_id=person_id)
+                repository.flush_frame(frame_id)
+                # Publish only after the frame transaction succeeds. Future notifiers
+                # can consume this same committed new-alert batch.
+                for alert in new_alerts:
+                    text = f"{alert.triggered_at:%Y-%m-%d %H:%M:%S} [{alert.severity}] {alert.message}"
+                    st.toast(text)
+                    live_alerts.append(text)
+                if new_alerts:
+                    live_alerts = live_alerts[-config.ALERT_LIVE_LIST_LIMIT:]
+                    alerts_placeholder.write(list(reversed(live_alerts)))
 
                 # Frame completed without raising -> reset the failure streak.
                 consecutive_failures = 0
@@ -742,6 +816,10 @@ def run_surveillance():
 
                 if stop_btn:
                     break
+            except StorageFatalError as exc:
+                aborted_reason = f"Fatal storage error at frame {frame_id}: {exc}"
+                logging.error(aborted_reason)
+                break
             except (KeyboardInterrupt, SystemExit):
                 # Never swallow these — let the interpreter unwind. The finally
                 # block below still releases the capture handle.
@@ -764,14 +842,48 @@ def run_surveillance():
                     logging.error("run_surveillance: %s", aborted_reason)
                     break
                 continue
+    except StorageFatalError as exc:
+        aborted_reason = f"Fatal storage error: {exc}"
+    except (KeyboardInterrupt, SystemExit):
+        interrupted = True
+        raise
+    except Exception as exc:
+        aborted_reason = f"Surveillance setup failed: {exc}"
+        raise
     finally:
         # Always runs: normal end, abort path, and user interruption.
         cap.release()
         loop_seconds = time.perf_counter() - loop_started
-        unfinished_vlm = activity_analyzer.shutdown(
-            timeout=config.VLM_SHUTDOWN_TIMEOUT if reached_eof else 0.0
-        )
-        st.session_state.processing_complete = reached_eof and not aborted_reason
+        try:
+            unfinished_vlm = activity_analyzer.shutdown(
+                timeout=config.VLM_SHUTDOWN_TIMEOUT if reached_eof else 0.0
+            )
+        except Exception as exc:
+            aborted_reason = aborted_reason or f"Activity shutdown failed: {exc}"
+        if repository is not None:
+            try:
+                if activity_observer is not None and not aborted_reason:
+                    activity_observer.log_activities(list(activity_analyzer.activity_cache.values()))
+                repository.flush()
+            except StorageFatalError as exc:
+                aborted_reason = f"Fatal storage error during final flush: {exc}"
+            finally:
+                if run_id is not None:
+                    status = ('aborted' if aborted_reason else
+                              'interrupted' if interrupted or not reached_eof else 'completed')
+                    st.session_state.run_status = status
+                    try:
+                        repository.end_run(run_id, status, processed_frames, total_failures)
+                    except StorageFatalError as exc:
+                        aborted_reason = (f"Fatal storage error saving run status: {exc}. "
+                                          "Any saved recovery record will be retried when storage is available.")
+                        st.session_state.run_status = 'aborted'
+                        try:
+                            repository.end_run(run_id, 'aborted', processed_frames, total_failures)
+                        except StorageFatalError:
+                            pass
+                repository.close()
+        st.session_state.processing_complete = reached_eof and not aborted_reason and not interrupted
         st.session_state.surveillance_metrics = {
             "source_frames": frame_id, "processed_frames": processed_frames,
             "processing_seconds": loop_seconds,
@@ -978,7 +1090,7 @@ def main():
 
     if v_path:
         # In Streamlit, we use tabs to navigate the app's workflow
-        tab1, tab2, tab3, tab4 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst", "🔥 Heatmap & Trajectory"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst", "🔥 Heatmap & Trajectory", "Alert Rules"])
         
         with tab1:
             define_zones_ui()
@@ -989,6 +1101,7 @@ def main():
 
         with tab2:
             st.header("Surveillance Execution")
+            recording_start_input()
             # This is the "Start Surveillance" button
             if st.button("🚀 Start Surveillance Engine"):
                 run_surveillance()
@@ -999,7 +1112,7 @@ def main():
                 st.info("📊 Shelby needs you to run the Surveillance Engine first so she has logs to analyze.")
                 
                 # Option to initialize anyway if logs already exist from a previous run
-                if os.path.exists(config.LOG_PATH):
+                if not LogAnalyzer().load_data().empty:
                     if st.button("Initialize Analyst with existing logs"):
                         st.session_state.processing_complete = True
                         st.rerun()
@@ -1012,6 +1125,8 @@ def main():
             if st.checkbox("Show heatmap and trajectory", value=False):
                 run_heatmap_tab()
 
+        with tab5:
+            alert_rules_tab()
 
 
 

@@ -5,7 +5,12 @@ load_dotenv(override=True)
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_DIR = os.path.join(BASE_DIR, "data", "uploaded_videos")
-LOG_PATH = os.path.join(BASE_DIR, "storage", "event_logs.csv")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///storage/shelby.db")
+# Additive alert rules use source-video seconds, independent of FPS/frame skipping.
+ALERT_DEFAULT_COOLDOWN_SECONDS = 30.0
+ALERT_DEFAULT_DURATION_SECONDS = 5.0
+ALERT_DEFAULT_ACTIVITY_CONFIDENCE = 0.8
+ALERT_LIVE_LIST_LIMIT = 50  # UI retention only; every alert is saved in SQLite.
 # Model Configuration
 MODEL_PATH = "yolov8n-pose.pt"
 YOLO_CPU_BACKEND = "onnx"  # Falls back to PyTorch if a validated export is absent.
@@ -211,6 +216,8 @@ VLM_ACTIVITY_API_TIMEOUT = 10.0
 # Very new tracks may have insufficient context for reliable analysis.
 # At FRAME_SKIP=2, 15 frames ≈ 1 second of real time.
 VLM_ACTIVITY_MIN_TRACK_AGE = 15
+# Analyst narration only; does not change VLM analysis or persisted observations.
+VLM_ACTIVITY_MIN_LOG_CONFIDENCE = 0.5
 
 # Only analyze tracks with at least this many unique positions in the buffer.
 # Prevents analyzing stationary people (e.g., always standing in same spot).
