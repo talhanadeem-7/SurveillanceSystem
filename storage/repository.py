@@ -77,9 +77,16 @@ class Repository:
                   metadata=None, commit=True):
         if camera_id is None:
             camera_id = self.ensure_camera(source or video_name, video_name)
+        metadata = dict(metadata or {})
+        camera = self.session.get(Camera, camera_id)
+        source_path = Path(source or camera.source)
+        if source_path.is_file():
+            stat = source_path.stat()
+            metadata.update(source_path=str(source_path.resolve()),
+                            source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns)
         run = Run(id=new_id(), camera_id=camera_id, video_name=video_name,
                   started_at=as_datetime(started_at), status='running',
-                  metadata_json=metadata or {})
+                  metadata_json=metadata)
         self.session.add(run)
         self.session.flush()
         if commit:
@@ -209,8 +216,59 @@ class Repository:
         return [self._dict(row) for row in self.session.scalars(select(Run).order_by(Run.started_at))]
 
     @storage_operation
+    def get_identity_evidence(self, sources):
+        """Resolve only explicit row/person links; never join on a display name or track label."""
+        rows = {}
+        for kind, model in [('event', Event), ('alert', AlertRecord), ('activity', ActivityObservation)]:
+            ids = [int(s['source_id']) for s in sources
+                   if s.get('source_type') == kind and str(s.get('source_id', '')).isdigit()]
+            if ids:
+                for row in self.session.scalars(select(model).where(model.id.in_(ids))):
+                    rows[(kind, row.id, row.run_id)] = row
+        person_ids = {r.person_id for r in rows.values() if r.person_id}
+        if not person_ids:
+            return {}
+        people = {p.id: p for p in self.session.scalars(select(Person).where(Person.id.in_(person_ids)))}
+        histories = {}
+        for event in self.session.scalars(select(Event).where(
+                Event.person_id.in_(person_ids), Event.action == 'Identity').order_by(Event.id)):
+            histories.setdefault((event.run_id, event.person_id), []).append(dict(
+                source_id=event.id, frame_no=event.frame_no,
+                timestamp=event.timestamp.isoformat(), status=event.status))
+        result = {}
+        for key, row in rows.items():
+            person = people.get(row.person_id)
+            if person is None or person.run_id != row.run_id:
+                continue
+            history = histories.get((row.run_id, person.id), [])
+            names = {e['status'][len('Recognized as '):] for e in history
+                     if e['status'].startswith('Recognized as ')}
+            conflict = any(e['status'].startswith('Revoked ') for e in history) or len(names) > 1
+            resolved = (not conflict and len(names) == 1 and person.is_enrolled
+                        and person.display_name in names)
+            result[key] = dict(run_id=row.run_id, person_id=person.id, track_id=person.track_id,
+                recorded_frame=row.frame_no, resolved_name=person.display_name if resolved else None,
+                identity_state='resolved' if resolved else ('conflicting_or_revoked' if conflict else 'unresolved'),
+                identity_events=history)
+        return result
+
+    @storage_operation
     def get_cameras(self):
         return [self._dict(row) for row in self.session.scalars(select(Camera).order_by(Camera.created_at))]
+
+    @storage_operation
+    def get_clip_source(self, source_type, source_id):
+        """Resolve a persisted incident to its run and recording, without loading media."""
+        model = {'event': Event, 'alert': AlertRecord, 'activity': ActivityObservation}.get(source_type)
+        if model is None:
+            raise ValueError('Unknown incident type.')
+        row = self.session.get(model, int(source_id))
+        if row is None:
+            raise ValueError('Incident no longer exists.')
+        run = self.session.get(Run, row.run_id)
+        camera = self.session.get(Camera, run.camera_id)
+        return dict(self._dict(row), source_path=run.metadata_json.get('source_path', camera.source),
+                    run_metadata=dict(run.metadata_json))
 
     @storage_operation
     def get_zones(self, run_id):

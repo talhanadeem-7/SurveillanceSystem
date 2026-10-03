@@ -28,9 +28,9 @@ class LogRetriever:
         Reads the latest database events and activity observations and rebuilds the Vector Database.
         """
         print("Loading logs for ingestion...")
-        log_sentences = self.log_analyzer.get_all_logs_formatted()
+        records = self.log_analyzer.get_narration_records()
         
-        if not log_sentences:
+        if not records:
             self.vector_store = None
             self._empty = True
             print("No logs found to ingest.")
@@ -38,7 +38,7 @@ class LogRetriever:
 
         self._empty = False
         # Convert strings to LangChain Documents
-        docs = [Document(page_content=text) for text in log_sentences]
+        docs = [Document(page_content=text, metadata=metadata) for text, metadata in records]
 
         print(f"Ingesting {len(docs)} observations into Knowledge Base using OpenAI...")
         
@@ -75,4 +75,4 @@ class LogRetriever:
 
         print(f"Searching Knowledge Base for: '{query}'...")
         results = self.vector_store.similarity_search(query, k=k)
-        return results
+        return self.log_analyzer.enrich_identity(results)

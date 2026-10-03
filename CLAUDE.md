@@ -1070,3 +1070,196 @@ their retriever re-ingested to rebuild an already-created event-only Chroma inde
   disabled VLM, so activity ingestion is covered by the synthetic tests above,
   not a live paid VLM/embedding/chat run. `app.py`, vision code and existing vision
   thresholds were unchanged.
+
+## On-demand incident clips - 2026-10-03
+
+### Audit and implementation
+
+Code audit found that runs already resolve through `camera_id` to the uploaded
+file in `cameras.source`, and `source_fps` was already saved in run metadata.
+The narration layer discarded row IDs and frame numbers before Chroma ingestion.
+The pipeline's stored frame numbers are one-based source frames, so clip timing
+uses `(frame_no - 1) / native_fps`, independent of FRAME_SKIP. Existing alert
+timestamps use `frame_no / fps`; that one-frame difference was retained to avoid
+changing alert behavior or narration text.
+
+New runs snapshot the source path, size and modification time. Every narration
+document now retains source_type/source_id/run_id/frame_no and display metadata;
+collapsed activities reference their first observation. Legacy null frames are
+represented by -1 in Chroma and cannot resolve to footage. SecurityAnalyst returns
+text plus up to five validated, model-selected retrieved citations. Streamlit
+retains the history and last answer's citations. Only Show clip clicks or explicit
+footage chat requests invoke the clip service. Ambiguous matches ask for details.
+
+`storage/clips.py` provides the source-agnostic get_clip interface, file-backed
+H.264 cutting, bounded windows, cache reuse, and unavailable reasons. FFmpeg is
+resolved from PATH or imageio-ffmpeg; cache files are ignored under storage/clips/.
+No vision module, model, vision threshold or legacy app.py was changed.
+See `docs/INCIDENT_CLIPS.md` for operation, limitations and reproduction commands.
+
+Existing Chroma indexes must be rebuilt: restart the Streamlit session and open
+Shelby Analyst (its constructor re-ingests), or explicitly call
+`analyst.retriever.ingest_logs()`. Repeat for any run-scoped index in use. Ask old
+questions again to obtain citations with metadata. SQLite needs no schema migration.
+
+### Measured results
+
+- **VF-53 - Provenance and demand gating pass local tests.** All **67 unit tests**
+  passed, process exit **0**, including **8** new incident tests. Captured Chroma
+  documents covered event, alert and collapsed activity provenance; the latter
+  resolved to the first observation. Exact UTF-8 narration comparisons passed.
+  Tested citation selection/cap/invalid IDs, positive and negative footage intent,
+  references and ambiguous/empty matches, source-native timing and boundary
+  clamping, actual local cuts, cache reuse without an encoder call, and missing,
+  replaced, corrupt and encoder-failure paths. Streamlit AppTest observed no clip
+  call for ordinary questions or ambiguous requests; button and unambiguous
+  reference requests did call the service. Embeddings and chat were mocked.
+- **VF-54 - Real office footage reaches a requested H.264 clip.**
+  `scripts/verify_storage_pipeline.py` exited **0** on the full office CCTV clip:
+  **739 / 1479** analyzed/source frames, **1050 detections**, **29 ephemeral**,
+  **6 tracks**, no frame/UI errors, and the established track-4/track-6 split
+  at **429 / 450**. Run completed with **10 events**, and stored event payloads
+  matched emitted events. Final loop time **52.4852 s**, **14.0802 analyzed FPS**;
+  this is one measurement, not a claimed speed improvement. VLM was disabled.
+  `scripts/verify_incident_clips.py` then exited **0**: a real-run Analyst question
+  with mocked APIs produced no clip directory and no video widget before the
+  production Show clip button was clicked through AppTest. Source incident frame
+  **802**, native **25 FPS**, yielded **27.04-42.04 s**. ffprobe reported **H.264,
+  yuv420p, 375 frames, 15.000000 s**. Decoded clip frame 0 vs source index 676 had
+  mean absolute pixel error **0.6037 / 255**; clip frame 125 vs incident source
+  index 801 had **0.8713 / 255**. The Streamlit video widget's autoplay flag was
+  false. Temporary verification databases, clips, downloaded tools and logs were
+  removed after measurements; retained scripts reproduce the checks.
+
+### Remaining verification / limitations
+
+Actual browser decoder playback is **not verified**: the computer-use tool listed
+no browsers and rejected creation of an in-app browser as unavailable. AppTest
+and ffprobe checks above do not substitute for pressing Play in a browser.
+Variable-frame-rate timing needs per-frame presentation timestamps; current
+timing targets constant-FPS uploaded recordings. Old runs lack source fingerprints.
+No live-camera archive or cache eviction policy was added. Citation attribution
+comes from the model's selected record numbers, not an independent semantic audit.
+
+### Footage UX correction - 2026-10-03
+
+Supersedes the initial incident-row/button UI above: normal answers now show
+text only. Citations stay internal. `show me the footage` resolves the preceding
+answer's access/removal events; multiple eligible events ask for a person/time.
+Identity and activity citations do not become footage candidates. Access,
+Intrusion, Removal and Theft map to authorized/unauthorized access/removal.
+Only the latest requested player is rendered, with autoplay off. Clip windows
+are now 3 seconds before and 5 seconds after the event, clamped to video bounds.
+The changed window participates in the cache key, so old 15-second clips are
+not reused for these requests.
+
+- **VF-55 - Request-only security clips verified.** All **69 unit tests** passed
+  (exit 0), including **10 incident tests**. AppTest measured zero incident rows
+  and buttons for normal answers, no cut until `show me the footage`, and one
+  display call with five prior requested clips in history. Tests covered mixed
+  activity/identity/security citations, ambiguity and auth/unauth access/removal
+  aliases. Actual H.264 cuts of a 20-second, 10-FPS fixture contained **50, 80,
+  and 31 frames** for start, middle and end events respectively, preserving the
+  configured 3/5-second window and boundary clamping. Temporary test media was
+  automatically removed. Browser playback was not rechecked.
+
+### Late-recognition Analyst audit - 2026-10-03
+
+- **VF-56 - sample20 retains the identity link that Analyst context can omit.**
+  Read-only inspection of the saved sample20 run found Intrusion frames **180,
+  396**, recognition at **424**, and Access frames **424, 774**, all joined to
+  the same person row (track 1, current name Talha, enrolled). A separate real
+  CPU run with the verification script's central Test desk zone completed at
+  **520 / 1040** analyzed/source frames, **16.1924 analyzed FPS**, no frame/UI
+  errors. Its Intrusion at **168**, recognition at **424**, and Access at
+  **424, 734** also shared track 1/Talha. VLM was disabled. A mocked retrieval
+  test supplied only the real earlier Intrusion document to SecurityAnalyst;
+  captured LLM context contained Person_1 but **no Talha identity link**. This
+  verifies missing deterministic context, not live-model response quality or
+  the production embedding rank. No paid APIs were called. Test database/logs
+  were removed; the original database was inspected read-only.
+
+Proposed follow-up, not implemented in this audit: attach run/person-scoped
+identity evidence and recognition/revocation timing to each retrieved incident;
+keep original event classifications as audit history. Explain early alerts as
+pre-recognition flags for the subsequently identified track, without inventing
+another person or treating recognition as proof every historical action was
+authorized. Do not map Person_1 across different runs or blindly apply a final
+name across conflicting/revoked identities. The current prompt's global name
+replacement and unconditional retrospective authorization rules need replacement.
+
+### Late-recognition context fix implemented - 2026-10-03
+
+The proposed follow-up above is now implemented. Repository.get_identity_evidence
+batch-resolves incident source rows to explicit person foreign keys and the same
+run's Identity events. LogAnalyzer.enrich_identity refreshes this evidence from
+SQLite on every retrieval, including previously indexed documents. Source text,
+original classifications, citation IDs and footage provenance are preserved.
+SecurityAnalyst passes the evidence alongside each numbered record and explains
+early unknown-person flags as pre-recognition history when the link is resolved.
+It no longer treats recognition as proof of ownership or blanket authorization.
+
+Resolution requires one consistent recognized name matching the enrolled person
+row. Any recorded revocation or competing recognized name blocks retrospective
+resolution for that track; history is included as uncertain evidence. This is
+deliberately conservative rather than guessing identity intervals. Unlinked rows
+and rows with mismatched run IDs get no identity attribution. No vision changes.
+
+- **VF-57 - Identity evidence survives retrieval of only earlier intrusions.**
+  All **73 unit tests** passed (exit 0), including four new tests covering late
+  updates, unchanged source text/rows, run isolation, stale evidence removal,
+  missing person links, revoked/conflicting identities and the real retriever-to-
+  Analyst context path with mocked search/chat. On a temporary read-only-origin
+  snapshot of the saved sample20 run, retrieving only the Intrusion records at
+  frames **180 and 396** attached resolved_name **Talha** and the recognition
+  event at **424** to both. Captured model context contained this evidence even
+  though neither search hit was an Identity document. Both narration strings
+  remained identical. The temporary database was automatically deleted.
+  No paid API calls were made; this verifies supplied context, not live-model
+  compliance or embedding ranking. The full vision run measured in VF-56 was
+  not repeated for this Analyst-only change.
+
+Restart Streamlit/reopen the Analyst to load the new code. Identity evidence is
+refreshed at query time, so an existing provenance-bearing index need not be
+re-embedded solely for this fix. Indexes older than incident metadata still need
+the rebuild described above. Old chat answers are not rewritten; ask again.
+
+## Dashboard visual redesign - 2026-10-03
+
+Presentation-only restyle of `streamlit_app.py` to the supplied mockup: dark theme
+(`.streamlit/config.toml` + injected CSS), branded sidebar with workflow steps and
+footage card, pill tab bar, MODEL READY status, and a Zone Setup page with a framed
+canvas plus a Zones naming panel. The Passive (polygon) drawing option is no longer
+shown; the canvas always draws restricted rectangles. Zone dict construction, the
+passive save branch, and all surveillance/analyst logic are unchanged. Verified: 73
+unit tests pass and an AppTest render had no exceptions; browser appearance was not
+checked by an automated test.
+
+## Analyst conversation and answer structure - 2026-10-04
+
+Added agents/conversation.py to keep pending footage choices in session state.
+Clear requests and ordinal selections use local rules; meaningful person/action/
+location/time fields narrow candidates. Unclear requests can make one additional
+configured chat-model call, constrained to numbered stored candidates. Invalid
+or multiple selections and failed calls ask for clarification. Explanation
+questions clear pending choices and do not cut footage. Only the latest requested
+player is rendered, still paused, with the existing 3-before/5-after clip window.
+Source-agnostic clip service and vision code were not changed for this task.
+
+SecurityAnalyst now requests structured summary/event/identity prose and renders
+the sections in Python; invalid event references are discarded and only cited
+records are used. Greetings remain short. Model temperature is zero; this does
+not guarantee identical or correct prose. Existing delayed-recognition evidence
+and original narration remain intact. Restart Streamlit to load the new code.
+
+- **VF-58 - Stateful footage dialogue tested with mocked APIs.** Full suite:
+  **80 tests passed**, exit 0. Seven new tests covered pending choices and
+  earlier-event selection, cancellation, out-of-range options, cross-run ambiguity,
+  12-hour time matching, unknown-person clarification, validated model selection,
+  API/JSON failure, and structured answer ordering. Streamlit AppTest ran the
+  proposed conversation: ordinary question -> "Can I see what happened?" ->
+  "The earlier one" -> "Why was he marked unauthorized?". The clip handler was
+  called exactly once, only after the selection, and the final explanation
+  showed no video widget. No paid APIs or live browser playback were exercised;
+  intent-model accuracy on varied live wording remains unmeasured. No temporary
+  media or databases were retained by these conversation tests.

@@ -6,6 +6,9 @@ load_dotenv(override=True)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_DIR = os.path.join(BASE_DIR, "data", "uploaded_videos")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///storage/shelby.db")
+CLIP_PRE_SECONDS = 3
+CLIP_POST_SECONDS = 5
+CLIP_CACHE_DIR = os.path.join(BASE_DIR, "storage", "clips")
 # Additive alert rules use source-video seconds, independent of FPS/frame skipping.
 ALERT_DEFAULT_COOLDOWN_SECONDS = 30.0
 ALERT_DEFAULT_DURATION_SECONDS = 5.0

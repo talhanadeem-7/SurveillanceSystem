@@ -42,10 +42,199 @@ def configure_logging():
         force=True,
     )
 
+
+# --- VISUAL THEME (presentation only) ---
+
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root {
+  --sh-bg: #0B0E13; --sh-panel: #10141B; --sh-panel-2: #141922; --sh-border: #232A35;
+  --sh-text: #E6E9EF; --sh-muted: #8B93A1; --sh-orange: #FF8A3D; --sh-green: #3FB950;
+  --sh-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+html, body, [class*="css"], .stApp, .stMarkdown, button, input, textarea, select {
+  font-family: 'Inter', system-ui, sans-serif;
+}
+.stApp { background: var(--sh-bg); }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { padding-top: 2.2rem; max-width: 1500px; }
+h1, h2, h3 { font-weight: 700; letter-spacing: -0.01em; }
+
+/* Sidebar */
+[data-testid="stSidebar"] { background: #0D1117; border-right: 1px solid var(--sh-border); }
+[data-testid="stSidebar"] .block-container, [data-testid="stSidebarUserContent"] { padding-top: 1.4rem; }
+.sh-brand { display:flex; align-items:center; gap:14px; margin-bottom: 30px; }
+.sh-logo { width:44px; height:44px; border-radius:11px; background: var(--sh-orange);
+  display:flex; align-items:center; justify-content:center; }
+.sh-brand-name { font-weight:700; font-size:20px; color: var(--sh-text); line-height:1.1; letter-spacing:.02em; }
+.sh-brand-sub { font-family: var(--sh-mono); font-size:12px; color: var(--sh-muted); }
+.sh-eyebrow { font-family: var(--sh-mono); font-size:12px; letter-spacing:.18em; color: var(--sh-muted);
+  text-transform: uppercase; margin: 6px 0 10px; }
+.sh-step { display:flex; align-items:center; gap:14px; padding:11px 14px; border-radius:10px;
+  color: var(--sh-muted); font-size:15px; margin-bottom:6px; border:1px solid transparent; }
+.sh-step.active { background: var(--sh-panel-2); border-color: var(--sh-border); color: var(--sh-text); font-weight:600; }
+.sh-step.done { color: #C9CED6; }
+.sh-step-dot { width:26px; height:26px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  font-family: var(--sh-mono); font-size:12px; border:1px solid var(--sh-border); flex-shrink:0; }
+.sh-step.active .sh-step-dot { background: var(--sh-orange); border-color: var(--sh-orange); color:#111; font-weight:700; }
+.sh-step.done .sh-step-dot { background: rgba(63,185,80,.12); border-color: rgba(63,185,80,.35); color: var(--sh-green); }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
+  background: transparent; border: 1px dashed #2E3643; border-radius: 12px; padding: 22px 14px;
+}
+.sh-file { display:flex; align-items:center; gap:14px; padding:12px 14px; margin-top:12px;
+  background: var(--sh-panel); border:1px solid var(--sh-border); border-radius:12px; }
+.sh-file-icon { width:40px; height:40px; border-radius:9px; background: var(--sh-panel-2);
+  display:flex; align-items:center; justify-content:center; color: var(--sh-muted); }
+.sh-file-name { color: var(--sh-text); font-weight:600; font-size:15px; }
+.sh-file-meta { font-family: var(--sh-mono); font-size:12px; color: var(--sh-muted); }
+
+/* Top bar status */
+.sh-status-anchor { position: relative; height: 0; }
+.sh-status { position:absolute; right:0; top:4px; z-index:5; display:flex; align-items:center; gap:8px;
+  font-family: var(--sh-mono); font-size:12px; letter-spacing:.08em; padding:8px 14px; border-radius:999px;
+  border:1px solid rgba(63,185,80,.35); background: rgba(63,185,80,.08); color: var(--sh-green); }
+.sh-status.loading { border-color: var(--sh-border); background: var(--sh-panel); color: var(--sh-muted); }
+.sh-status-dot { width:7px; height:7px; border-radius:50%; background: currentColor; }
+
+/* Tabs as a pill bar */
+.stTabs [data-baseweb="tab-list"] { gap:4px; width: fit-content; padding:6px; background: var(--sh-panel);
+  border:1px solid var(--sh-border); border-radius:12px; }
+.stTabs [data-baseweb="tab"] { height:auto; padding:9px 18px; border-radius:8px; color: #B4BAC4; background: transparent; }
+.stTabs [data-baseweb="tab"] p { font-size:15px; font-weight:500; }
+.stTabs [aria-selected="true"] { background: #1C222C; color: var(--sh-text); }
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display:none; }
+.stTabs [data-baseweb="tab-panel"] { padding-top: 2rem; }
+
+/* Page header */
+.sh-page { display:flex; justify-content:space-between; align-items:flex-end; gap:20px; flex-wrap:wrap; margin-bottom:22px; }
+.sh-page-eyebrow { font-family: var(--sh-mono); color: var(--sh-orange); font-size:13px; letter-spacing:.15em; }
+.sh-page-title { font-size:34px; font-weight:700; color: var(--sh-text); margin:4px 0 6px; letter-spacing:-.01em; }
+.sh-page-sub { color: var(--sh-muted); font-size:16px; }
+.sh-mode { display:flex; align-items:center; gap:12px; padding:12px 20px; border-radius:12px;
+  border:1px solid var(--sh-orange); background: rgba(255,138,61,.08); color: var(--sh-text); font-weight:600; }
+.sh-mode-radio { width:16px; height:16px; border-radius:50%; border:2px solid var(--sh-orange);
+  display:flex; align-items:center; justify-content:center; }
+.sh-mode-radio::after { content:''; width:8px; height:8px; border-radius:50%; background: var(--sh-orange); }
+.sh-mode-rect { width:16px; height:11px; border:1.5px solid var(--sh-orange); border-radius:2px; }
+.sh-mode-tag { font-family: var(--sh-mono); font-size:12px; color: var(--sh-muted); letter-spacing:.08em; }
+
+/* Cards */
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > [data-testid="stVerticalBlock"]) {
+  border-color: var(--sh-border) !important; border-radius: 14px; background: var(--sh-panel);
+}
+.sh-card-head { display:flex; justify-content:space-between; align-items:center; padding-bottom:14px;
+  margin-bottom:6px; border-bottom:1px solid var(--sh-border); }
+.sh-frame-label { font-family: var(--sh-mono); font-size:14px; color: var(--sh-text); display:flex; align-items:center; gap:10px; }
+.sh-rec { width:9px; height:9px; border-radius:50%; background:#F85149; }
+.sh-legend { display:flex; gap:22px; align-items:center; color: var(--sh-muted); font-size:14px;
+  padding-top:12px; border-top:1px solid var(--sh-border); }
+.sh-legend-box { display:inline-block; width:15px; height:15px; border:2px solid var(--sh-orange); border-radius:2px;
+  vertical-align:-3px; margin-right:8px; }
+.sh-zones-title { font-size:20px; font-weight:600; color: var(--sh-text); }
+.sh-zones-count { font-family: var(--sh-mono); font-size:12px; color: var(--sh-muted); letter-spacing:.08em; }
+.sh-zone-tag { font-family: var(--sh-mono); font-size:13px; color: var(--sh-orange); letter-spacing:.06em; }
+.sh-zone-tag::before { content:''; display:inline-block; width:9px; height:9px; background: var(--sh-orange); margin-right:10px; }
+.sh-hint { color: var(--sh-muted); font-size:14px; line-height:1.55; }
+.sh-saved { font-family: var(--sh-mono); font-size:12px; color: var(--sh-green); letter-spacing:.04em; }
+
+/* Inputs and buttons */
+[data-testid="stTextInput"] input { background: #0A0D12; border-radius: 9px; }
+.stButton > button, [data-testid="stFormSubmitButton"] > button { border-radius: 10px; font-weight:600; padding: .55rem 1.2rem; }
+[data-testid="stFormSubmitButton"] > button[kind="primaryFormSubmit"], .stButton > button[kind="primary"] {
+  background: var(--sh-orange); border-color: var(--sh-orange); color: #15100B;
+}
+</style>
+"""
+
+SHIELD_SVG = (
+    '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#15100B" stroke-width="2.2" '
+    'stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.5 9.3-8 11-4.5-1.7-8-6-8-11V5z"/>'
+    '<circle cx="12" cy="11" r="2.6"/></svg>'
+)
+CAMERA_SVG = (
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="14" height="12" rx="2"/>'
+    '<path d="M16 10l6-3v10l-6-3z"/></svg>'
+)
+
+
+def _html(markup, target=st):
+    target.markdown(markup, unsafe_allow_html=True)
+
+
+def _short_name(name, limit=14):
+    stem, ext = os.path.splitext(name)
+    return name if len(name) <= limit else f"{stem[:limit - len(ext) - 1]}…{ext}"
+
+
+def inject_theme():
+    _html(THEME_CSS)
+
+
+def page_header(eyebrow, title, subtitle="", right_html=""):
+    _html(
+        f'<div class="sh-page"><div><div class="sh-page-eyebrow">{eyebrow}</div>'
+        f'<div class="sh-page-title">{title}</div><div class="sh-page-sub">{subtitle}</div></div>'
+        f'{right_html}</div>'
+    )
+
+
+def render_sidebar_brand():
+    _html(
+        f'<div class="sh-brand"><div class="sh-logo">{SHIELD_SVG}</div><div>'
+        '<div class="sh-brand-name">SHELBY</div><div class="sh-brand-sub">Intelligent Surveillance</div>'
+        '</div></div>',
+        st.sidebar,
+    )
+
+
+def render_sidebar_workflow(target):
+    has_video = bool(st.session_state.get("video_path"))
+    has_zones = bool(st.session_state.get("zones"))
+    finished = bool(st.session_state.get("processing_complete"))
+    steps = [
+        ("Upload footage", has_video, not has_video),
+        ("Define zones", has_zones, has_video and not has_zones),
+        ("Run analysis", finished, has_zones and not finished),
+    ]
+    rows = []
+    for number, (label, done, active) in enumerate(steps, start=1):
+        state = "done" if done else ("active" if active else "")
+        dot = "&#10003;" if done else str(number)
+        rows.append(f'<div class="sh-step {state}"><div class="sh-step-dot">{dot}</div>{label}</div>')
+    _html('<div class="sh-eyebrow">Workflow</div>' + "".join(rows), target)
+
+
+def render_sidebar_file():
+    video_path = st.session_state.get("video_path")
+    if not video_path:
+        return
+    name = os.path.basename(video_path)
+    try:
+        size = f"{os.path.getsize(video_path) / (1024 * 1024):.1f} MB"
+    except OSError:
+        size = "-"
+    _html(
+        f'<div class="sh-file" title="{name}"><div class="sh-file-icon">{CAMERA_SVG}</div><div>'
+        f'<div class="sh-file-name">{_short_name(name)}</div>'
+        f'<div class="sh-file-meta">{size} · ready</div></div></div>',
+        st.sidebar,
+    )
+
+
+def render_model_status():
+    ready = "detector" in st.session_state
+    css, label = ("sh-status", "MODEL READY") if ready else ("sh-status loading", "LOADING MODEL")
+    _html(f'<div class="sh-status-anchor"><div class="{css}"><span class="sh-status-dot"></span>{label}</div></div>')
+
+
 def handle_video_upload():
-    # creates a button on the sidebar: "Upload Footage".
-    st.sidebar.header("1. Upload Footage")
-    uploaded_file = st.sidebar.file_uploader("Choose a video file", type=["mp4", "avi", "mov"])
+    # creates the footage uploader on the sidebar.
+    _html('<div class="sh-eyebrow" style="margin-top:28px">Footage</div>', st.sidebar)
+    uploaded_file = st.sidebar.file_uploader(
+        "Drop a video or browse", type=["mp4", "avi", "mov"], label_visibility="collapsed"
+    )
 
     if uploaded_file is not None:
         # Create directory if it doesn't exist
@@ -81,30 +270,27 @@ def handle_video_upload():
                 st.session_state.first_frame = frame_rgb
                 st.session_state.frame_shape = frame.shape # (H, W, C)
             cap.release()
-            
-            st.sidebar.success(f"Uploaded: {uploaded_file.name}")
-    
+
     return st.session_state.video_path
 
 
 # --- WEB-BASED ZONE DRAWING WITH MANUAL NAMING ---
 
 def define_zones_ui():
-    st.header("2. Define Surveillance Zones")
-    
+    mode_chip = (
+        '<div class="sh-mode"><span class="sh-mode-radio"></span><span class="sh-mode-rect"></span>'
+        'Restricted <span class="sh-mode-tag">RECT</span></div>'
+    )
+    page_header("STEP 02", "Define surveillance zones",
+                "Draw on the frame, name each zone, then save.", mode_chip)
+
     if 'first_frame' not in st.session_state:
         st.warning("Please upload a video first.")
         return
 
-    # 1. UI Selection for Drawing
-    col_ctrl, col_info = st.columns([1, 2])
-    with col_ctrl:
-        zone_type = st.radio("Drawing Mode", ["Restricted (Rectangle)", "Passive (Polygon)"], horizontal=False)
-    with col_info:
-        st.info("1. Draw your zones on the image. \n2. Scroll down to name them. \n3. Click Save.")
-
-    drawing_mode = "rect" if zone_type == "Restricted (Rectangle)" else "polygon"
-    stroke_color = "#FF0000" if drawing_mode == "rect" else "#FFFF00"
+    # Only restricted (rectangle) zones are offered in the UI.
+    drawing_mode = "rect"
+    stroke_color = "#FF8A3D"
 
     # Scaling Logic
     orig_h, orig_w = st.session_state.frame_shape[:2]
@@ -112,36 +298,51 @@ def define_zones_ui():
     scale_factor = orig_w / display_width
     display_height = int(orig_h / scale_factor)
 
+    col_canvas, col_zones = st.columns([2.2, 1], gap="medium")
+
     # 2. The Canvas
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.3)",
-        stroke_width=2,
-        stroke_color=stroke_color,
-        background_image=Image.fromarray(st.session_state.first_frame),
-        update_streamlit=True,
-        height=display_height,
-        width=display_width,
-        drawing_mode=drawing_mode,
-        key="canvas",
-    )
+    with col_canvas:
+        with st.container(border=True):
+            video_name = _short_name(os.path.basename(st.session_state.video_path or ""), 18)
+            _html(f'<div class="sh-card-head"><div class="sh-frame-label"><span class="sh-rec"></span>'
+                  f'{video_name} · frame 0</div></div>')
+            canvas_result = st_canvas(
+                fill_color="rgba(255, 138, 61, 0.18)",
+                stroke_width=2,
+                stroke_color=stroke_color,
+                background_image=Image.fromarray(st.session_state.first_frame),
+                update_streamlit=True,
+                height=display_height,
+                width=display_width,
+                drawing_mode=drawing_mode,
+                key="canvas",
+            )
+            _html('<div class="sh-legend"><span><span class="sh-legend-box"></span>'
+                  'Restricted: triggers alerts</span></div>')
 
     # 3. Dynamic Naming Logic
-    if canvas_result.json_data is not None:
-        objects = canvas_result.json_data["objects"]
-        
+    objects = canvas_result.json_data["objects"] if canvas_result.json_data is not None else []
+    zones_card = col_zones.container(border=True)
+    _html(f'<div class="sh-card-head"><span class="sh-zones-title">Zones</span>'
+          f'<span class="sh-zones-count">{len(objects)} DRAWN</span></div>', zones_card)
+    if len(objects) == 0:
+        _html('<p class="sh-hint">Drag a rectangle on the frame to add a restricted zone. '
+              'Use the canvas toolbar to undo or clear.</p>', zones_card)
+
+    with zones_card:
         if len(objects) > 0:
-            st.subheader("🏷️ Name your detected zones")
-            
             # We use a form to collect names and shapes all at once
-            with st.form("zone_naming_form"):
+            with st.form("zone_naming_form", border=False):
                 zone_names = []
                 for i, obj in enumerate(objects):
                     z_type = "Restricted" if obj["type"] == "rect" else "Passive"
                     # Generate a text input for every shape on the canvas
-                    name = st.text_input(f"Name for {z_type} Shape #{i+1}", value=f"{z_type}_{i+1}")
+                    with st.container(border=True):
+                        _html(f'<div class="sh-zone-tag">R{i+1} · {z_type.upper()}</div>')
+                        name = st.text_input("Zone name", value=f"{z_type}_{i+1}", key=f"zone_name_{i}")
                     zone_names.append(name)
-                
-                submit = st.form_submit_button("Confirm and Save Zones")
+
+                submit = st.form_submit_button("Save zones", type="primary", use_container_width=True)
                 
                 if submit:
                     processed_zones = []
@@ -192,6 +393,10 @@ def define_zones_ui():
 
                     st.session_state.zones = processed_zones
                     st.success(f"✅ Saved {len(processed_zones)} zones with custom names!")
+
+    if st.session_state.zones:
+        saved = ", ".join(z["name"] for z in st.session_state.zones if z["type"] != "passive")
+        _html(f'<div class="sh-saved">● SAVED: {saved}</div>', zones_card)
 
 def run_surveillance():
     #  It processes the video frame by frame.
@@ -308,7 +513,8 @@ def run_surveillance():
         run_id = repository.start_run(os.path.basename(st.session_state.video_path),
                                       source=st.session_state.video_path,
                                       metadata={"recording_start_time": recording_start.isoformat(),
-                                                "source_fps": native_fps})
+                                                "source_fps": native_fps,
+                                                "frame_number_base": 1})
         st.session_state.run_id = run_id
         repository.save_zones(run_id, zones)
         configured_rules, rule_warnings = resolve_rules(
@@ -948,25 +1154,9 @@ def run_shelby_analyst():
             st.session_state.analyst = SecurityAnalyst()
         st.success("Shelby is ready!")
 
-    # 2. Handle User Input (Memory-less Version)
-    if prompt := st.chat_input("Ask Shelby about the footage..."):
-        # Just show the current question
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    from agents.analyst_ui import analyst_chat
+    analyst_chat(st.session_state.analyst)
 
-        # 3. Call your agent's logic
-        with st.chat_message("assistant", avatar="🛡️"):
-            try:
-                response = st.session_state.analyst.consult(prompt)
-                st.markdown(response)
-            except Exception as e:
-                # OpenAI specific error handling
-                if "429" in str(e):
-                    st.error("🛑 OpenAI Rate Limit: You are sending requests too fast or your trial credits ran out.")
-                elif "insufficient_quota" in str(e):
-                    st.error("🛑 OpenAI Error: Your API key has no remaining credits.")
-                else:
-                    st.error(f"Error: {e}")
 
 def run_heatmap_tab():
     """
@@ -1083,31 +1273,33 @@ def run_heatmap_tab():
 
 
 def main():
-    st.title("🛡️ Shelby: Intelligent Surveillance Dashboard")
-    
+    inject_theme()
+
     # Sidebar
+    render_sidebar_brand()
+    workflow_slot = st.sidebar.container()
     v_path = handle_video_upload()
+    render_sidebar_file()
+    render_sidebar_workflow(workflow_slot)
+
+    render_model_status()
 
     if v_path:
         # In Streamlit, we use tabs to navigate the app's workflow
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst", "🔥 Heatmap & Trajectory", "Alert Rules"])
-        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Zone Setup", "Surveillance Feed", "Shelby Analyst", "Heatmap & Trajectory", "Alert Rules"])
+
         with tab1:
             define_zones_ui()
-            if st.session_state.zones:
-                st.write("Current Zones Configured:")
-                for z in st.session_state.zones:
-                    st.text(f"📍 {z['name']} ({z['type']})")
 
         with tab2:
-            st.header("Surveillance Execution")
+            page_header("STEP 03", "Run analysis", "Process the uploaded footage against your saved zones.")
             recording_start_input()
             # This is the "Start Surveillance" button
-            if st.button("🚀 Start Surveillance Engine"):
+            if st.button("🚀 Start Surveillance Engine", type="primary"):
                 run_surveillance()
-        
+
         with tab3:
-            st.header("Shelby Intelligence Analyst")
+            page_header("ANALYST", "Shelby Intelligence Analyst", "Ask questions about what happened in the footage.")
             if not st.session_state.get('processing_complete', False):
                 st.info("📊 Shelby needs you to run the Surveillance Engine first so she has logs to analyze.")
                 

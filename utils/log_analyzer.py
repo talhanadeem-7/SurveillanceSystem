@@ -1,6 +1,7 @@
 """Database-backed event narration and statistics for the analyst."""
 
 import pandas as pd
+import json
 import config
 from storage.repository import Repository
 
@@ -20,6 +21,7 @@ class LogAnalyzer:
                 for e in events]
         data = pd.DataFrame(rows, columns=columns)
         data.attrs["timestamps"] = [e["timestamp"] for e in events]
+        data.attrs["sources"] = events
         return data
 
     def get_recent_logs_as_text(self, limit=20):
@@ -113,10 +115,37 @@ class LogAnalyzer:
             else:
                 text = f"At {timestamp}, {entity} triggered {action_type} {prep} {loc}."
 
-            documents.append((df.attrs["timestamps"][index], text))
+            documents.append((df.attrs["timestamps"][index], text,
+                              self._metadata('event', df.attrs['sources'][index],
+                                             timestamp, entity, action_type, loc)))
 
         return documents
+    @staticmethod
+    def _metadata(kind, row, timestamp, person, action, location):
+        # Chroma rejects null metadata. -1 explicitly means unavailable legacy provenance.
+        return dict(source_type=kind, source_id=row['id'], run_id=row['run_id'],
+                    frame_no=row['frame_no'] if row['frame_no'] is not None else -1,
+                    time=timestamp, person=person, action=action, location=location)
+
     def get_all_logs_formatted(self):
+        return [text for text, _ in self.get_narration_records()]
+
+    def enrich_identity(self, documents):
+        """Refresh identity evidence from SQLite, even for a previously built Chroma index."""
+        with Repository(self.database_url) as repository:
+            evidence = repository.get_identity_evidence([d.metadata for d in documents])
+        enriched = []
+        for doc in documents:
+            metadata = dict(doc.metadata)
+            metadata.pop('identity_evidence', None)
+            key = (metadata.get('source_type'), metadata.get('source_id'), metadata.get('run_id'))
+            identity = evidence.get(key)
+            if identity:
+                metadata['identity_evidence'] = json.dumps(identity, ensure_ascii=False)
+            enriched.append(type(doc)(page_content=doc.page_content, metadata=metadata))
+        return enriched
+
+    def get_narration_records(self):
         """Merge security events and confidence-filtered activity spans by time.
 
         Spans are consecutive observations within one (run, track). A changed
@@ -157,10 +186,17 @@ class LogAnalyzer:
                                        for d in descriptions)
             else:
                 text += '.'
-            documents.append((first['timestamp'], text))
+            documents.append((first['timestamp'], text,
+                              self._metadata('activity', first, start, name,
+                                             first['activity_label'], 'Location not recorded')))
         for alert in alerts:
             timestamp = alert['triggered_at'].strftime('%Y-%m-%d %H:%M:%S')
             text = (f"At {timestamp}, a {alert['severity']} severity alert from rule "
                     f"'{alert['details_json']['rule_name']}' was triggered: {alert['message']}.")
-            documents.append((alert['triggered_at'], text))
-        return [text for _, text in sorted(documents, key=lambda item: item[0])]
+            details = alert['details_json']
+            track_id = details.get('track_id')
+            person = f'Person_{track_id}' if track_id is not None else 'Multiple / unspecified people'
+            documents.append((alert['triggered_at'], text,
+                              self._metadata('alert', alert, timestamp, person,
+                                             alert['message'], details.get('zone_name') or 'In view')))
+        return [(text, metadata) for _, text, metadata in sorted(documents, key=lambda item: item[0])]

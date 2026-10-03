@@ -20,6 +20,7 @@ python-dotenv==1.2.2
 openai==1.42.0          # OpenAI SDK for vision API (VLM activity analysis)
 
 # Utilities
+imageio-ffmpeg==0.6.0   # Local H.264 encoder fallback when ffmpeg is not on PATH
 tqdm==4.67.3
 
 # Midas Depth reasoning

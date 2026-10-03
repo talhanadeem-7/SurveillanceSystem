@@ -40,4 +40,8 @@ FYP_Proposal_extracted.txt
 /VLM.md
 /app.py
 
-tests/
+tests/*
+!tests/test_incident_clips.py
+!tests/test_identity_evidence.py
+!tests/test_analyst_conversation.py
+storage/clips/
